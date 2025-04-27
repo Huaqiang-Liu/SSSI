@@ -1,0 +1,7 @@
+{
+  "role": "host",
+  "model_name": "gpt2",
+  "layers": ["3.pt", "4.pt", "5.pt", "6.pt", "7.pt", "8.pt", "9.pt", "10.pt"],
+  "start_first": true,
+  "shm_path": "/dev/shm/shm1"
+}
