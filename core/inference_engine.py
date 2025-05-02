@@ -3,7 +3,7 @@ import torch
 from transformers import GPT2Config, GPT2Tokenizer, GPT2LMHeadModel
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 PAR_MODEL_DIR = "../model/gpt2_partitioned"
 MODEL_DIR = "../model/gpt2"  # 完整模型，测试用
@@ -15,14 +15,13 @@ class InferenceEngine:
         self.device = torch.device(device)
         self.config = GPT2Config.from_pretrained(par_model_dir)
         self.num_layers = self.config.n_layer
-        # 初始化分词器并设置 pad_token
         self.tokenizer = GPT2Tokenizer.from_pretrained(model_dir)
-        self.tokenizer.pad_token = self.tokenizer.eos_token  # 使用 eos_token 作为 pad_token
+        self.tokenizer.pad_token = self.tokenizer.eos_token
         self.layers = self._load_layers()
         self.embedding_layer, self.lm_head = self._load_embedding_and_lm_head()
         self.final_layernorm = self._load_final_layernorm()
 
-    def _load_layers(self) -> list:
+    def _load_layers(self) -> List[torch.nn.Module]:
         layers = []
         for i in range(self.num_layers):
             layer_path = os.path.join(self.par_model_dir, f"{i}.pt")
@@ -45,25 +44,39 @@ class InferenceEngine:
         model.eval()
         return model.transformer.ln_f
 
-    def infer_layer(self, layer_index: int, input_tensor: torch.Tensor, 
-                   attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def infer_layer(
+        self,
+        layer_index: int,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        layer_past: Optional[Tuple[torch.Tensor]] = None
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor]]:
         layer = self.layers[layer_index]
-        output = layer(input_tensor, attention_mask=attention_mask)[0]
-        return output
+        output = layer(hidden_states, attention_mask=attention_mask, layer_past=layer_past, use_cache=True)
+        new_hidden_states, new_past = output
+        return new_hidden_states, new_past
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        past_key_values: Optional[List[Tuple[torch.Tensor]]] = None,
+        attention_mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor]]]:
+        if past_key_values is None:
+            past_key_values = [None] * self.num_layers
+
         hidden_states = self.embedding_layer(input_ids)
-        print(f"嵌入层输出形状: {hidden_states.shape}")
+        new_past_key_values = []
 
         for i in range(self.num_layers):
-            print(f"层 {i} 输入形状: {hidden_states.shape}")
-            hidden_states = self.infer_layer(i, hidden_states, attention_mask)
-            print(f"层 {i} 输出形状: {hidden_states.shape}")
+            hidden_states, new_past = self.infer_layer(
+                i, hidden_states, attention_mask=attention_mask, layer_past=past_key_values[i]
+            )
+            new_past_key_values.append(new_past)
 
         hidden_states = self.final_layernorm(hidden_states)
         logits = self.lm_head(hidden_states)
-        print(f"最终 logits 形状: {logits.shape}")
-        return logits
+        return logits, new_past_key_values
 
     def generate_text(self, input_text: str, max_new_tokens: int = 10, use_sampling: bool = False) -> str:
         encoded_input = self.tokenizer(input_text, return_tensors="pt", padding=True)
@@ -71,10 +84,15 @@ class InferenceEngine:
         attention_mask = encoded_input["attention_mask"].to(self.device)
 
         generated_ids = input_ids.clone()
+        past_key_values = None
 
         with torch.no_grad():
             for _ in range(max_new_tokens):
-                logits = self.forward(generated_ids, attention_mask)
+                logits, past_key_values = self.forward(
+                    input_ids=generated_ids[:, -1:],
+                    past_key_values=past_key_values,
+                    attention_mask=None
+                )
                 next_token_logits = logits[:, -1, :]
 
                 if use_sampling:
@@ -86,10 +104,10 @@ class InferenceEngine:
                 else:
                     next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
 
-                generated_ids = torch.cat([generated_ids, next_token], dim=-1)
-                attention_mask = torch.cat(
-                    [attention_mask, torch.ones_like(next_token, dtype=torch.long)], dim=-1
-                )
+                generated_ids = torch.cat([generated_ids, next_token], dim=1)
+                attention_mask = torch.cat([
+                    attention_mask, torch.ones((attention_mask.size(0), 1), dtype=attention_mask.dtype, device=self.device)
+                ], dim=1)
 
                 if next_token.item() == self.tokenizer.eos_token_id:
                     break
@@ -103,7 +121,7 @@ def infer_par():
     inference_engine = InferenceEngine(device=device)
 
     user_input = input("请输入自然语言文本: ")
-    output_text = inference_engine.generate_text(user_input, max_new_tokens=10, use_sampling=True)
+    output_text = inference_engine.generate_text(user_input, max_new_tokens=100, use_sampling=True)
     print(f"生成输出: {output_text}")
 
 def infer_direct():
