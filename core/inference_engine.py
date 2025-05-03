@@ -6,9 +6,9 @@ from pdb import set_trace as st
 from llama_model import ModelArgs, Transformer, Tokenizer
 import sentencepiece as spm
 
-PAR_MODEL_DIR = "../model/llama2-partitioned"
-MODEL_DIR = "../model/llama2" # 完整模型，测试用
-TOKENIZER_PATH = "../model/llama2/tokenizer.model" # 分词器路径
+PAR_MODEL_DIR = "model/llama2-partitioned"
+MODEL_DIR = "model/llama2" # 完整模型，测试用
+TOKENIZER_PATH = "model/llama2/tokenizer.model" # 分词器路径
 
 
 def load_partitioned_model(model_dir: str, use_gpu=True):
@@ -43,21 +43,43 @@ def load_partitioned_model(model_dir: str, use_gpu=True):
 
     return model
 
+# 推理函数（多 token 生成）
+@torch.no_grad()
+def generate(model, tokenizer, prompt, max_new_tokens=64, temperature=0.0, device="cuda"):
+    model.eval()
+    input_ids = torch.tensor(
+        [tokenizer.encode(prompt, bos=True, eos=False)],
+        dtype=torch.long
+    ).to(device)
+    generated = input_ids
+    start_pos = 0
 
-def run_inference(model: Transformer, input_ids: torch.Tensor, start_pos: int = 0):
-    with torch.no_grad():
-        return model(input_ids, start_pos=start_pos)
+    for i in range(max_new_tokens):
+        logits = model(generated, start_pos=start_pos)
+        next_token_logits = logits[0, -1, :]  # 最后一个 token 的输出
+        if temperature == 0.0:
+            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+        else:
+            probs = torch.softmax(next_token_logits / temperature, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+
+        generated = torch.cat((generated, next_token.unsqueeze(0)), dim=1)
+        start_pos += 1
+
+        if next_token.item() == tokenizer.eos_id:  # 去掉函数调用括号
+            break
+
+    output_text = tokenizer.decode(generated[0].tolist())
+    return output_text
+
 
 if __name__ == "__main__":
-    sp = spm.SentencePieceProcessor()
-    sp.load(TOKENIZER_PATH)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model = load_partitioned_model(PAR_MODEL_DIR, use_gpu=(device == "cuda"))
+    tokenizer = Tokenizer(model_path=TOKENIZER_PATH)
 
     input_text = "How many states does the US have?"
-    input_ids = torch.tensor([sp.encode(input_text)], dtype=torch.long).cuda()
+    output = generate(model, tokenizer, input_text, max_new_tokens=64, temperature=0.0, device=device)
 
-    model = load_partitioned_model(PAR_MODEL_DIR)
-    output = run_inference(model, input_ids, start_pos=0)
-
-    print("Logits shape:", output.shape)
-    print("Top token:", torch.argmax(output[0, -1]).item())
-    print("Decoded:", sp.decode([torch.argmax(output[0, -1]).item()]))
+    print("Decoded:", output)

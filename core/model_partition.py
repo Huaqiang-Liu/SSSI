@@ -7,7 +7,7 @@ import os
 import json
 
 # 为了方便，仅支持本地
-def partition_model(model_path="../model/llama2", output_dir="../model/llama2-partitioned"):
+def partition_model(model_path="model/llama2", output_dir="model/llama2-partitioned"):
     import json
     os.makedirs(output_dir, exist_ok=True)
     
@@ -48,4 +48,4 @@ def partition_model(model_path="../model/llama2", output_dir="../model/llama2-pa
     print(f"模型分割完成，保存至: {output_dir}")
 
 if __name__ == "__main__":
-    partition_model(model_path="../model/llama2", output_dir="../model/llama2-partitioned")
+    partition_model(model_path="model/llama2", output_dir="model/llama2-partitioned")
