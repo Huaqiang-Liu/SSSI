@@ -19,6 +19,17 @@ MAX_BLOCK_NUM = 4087 # (16*1024*1024 - 1)//BLOCK_SIZE，1是读写锁使用的1�
 # payload_len uint16 该block的payload长度，上限是4096，所以uint16就够了
 BLOCK_HEADER_FORMAT = '<IHBH'
 
+# 辅助函数
+def get_msg_id(block: bytes) -> int:
+    # 解析block的header，获取msg_id
+    header = block[:HEADER_SIZE]
+    msg_id, _, _, _ = struct.unpack(BLOCK_HEADER_FORMAT, header)
+    return msg_id
+
+def clear_shm(shm): # 清空共享内存
+    shm[LOCK_OFFSET + 1:] = bytearray(len(shm) - 1)
+
+
 # 一层的输出->字节
 def serialize_tensor(tensor: torch.Tensor) -> bytes:
     np_array = tensor.detach().cpu().numpy()
@@ -95,7 +106,7 @@ def write_blocks(shm, blocks):
         for block in blocks:
             if block_count > 0 and block_count % MAX_BLOCK_NUM == 0:
                 # 先清空共享内存
-                shm[LOCK_OFFSET + 1:] = bytearray(len(shm) - 1)
+                clear_shm(shm)
                 release_lock(shm)
                 time.sleep(1)
                 acquire_lock(shm)
@@ -127,7 +138,7 @@ def read_blocks(shm):
             else:
                 # 可能读完了整个共享内存，仍没有读完整个tensor，这时要清空共享内存并从头开始，等1秒让写方接着写
                 if len(blocks) > 0 and len(blocks) % MAX_BLOCK_NUM == 0:
-                    shm[LOCK_OFFSET + 1:] = bytearray(len(shm) - 1)
+                    clear_shm(shm)
                     release_lock(shm)
                     time.sleep(1)
                     acquire_lock(shm)
