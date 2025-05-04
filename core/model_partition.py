@@ -1,4 +1,4 @@
-# 加载并切分 tiny-llama2-7b 模型层
+# 加载并切分llama2-7b模型层
 import torch
 import safetensors.torch
 from pathlib import Path
@@ -21,7 +21,6 @@ def partition_model(model_path="model/llama2", output_dir="model/llama2-partitio
         config = json.load(f)
 
     from llama_model import ModelArgs, Transformer
-    import safetensors.torch
 
     model_args = ModelArgs(
         dim=config["hidden_size"],
