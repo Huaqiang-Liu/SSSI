@@ -148,6 +148,10 @@ class Attention(nn.Module):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
+        # 下面这三行是最初的版本，因为维数对不上而修改
+        # xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        # xk = xk.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        # xv = xv.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
@@ -246,47 +250,110 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, params: ModelArgs):
+    # 从初始化整个模型到初始化模型的不同部分，以适配无完整模型的分布式推理
+    # 添加的参数：将所有层按推理顺序编号之后的起始和结束索引，以及总的层数（不止transformer层）
+    def __init__(self, params: ModelArgs, start_layer_idx: int = 0, end_layer_idx: int = -1, total_layers: int = 25):
         super().__init__()
         self.params = params
         self.vocab_size = params.vocab_size
-        self.n_layers = params.n_layers
+        self.n_layers = params.n_layers # 保留总层数
 
-        self.tok_embeddings = Embedding(
-            params.vocab_size, params.dim, 
-        )
+        if end_layer_idx == -1:
+            end_layer_idx = total_layers - 1
+
+        self.tok_embeddings = None
+        if start_layer_idx == 0: # embedding 层始终为 0
+            self.tok_embeddings = Embedding(
+                params.vocab_size, params.dim,
+            )
 
         self.layers = torch.nn.ModuleList()
-        for layer_id in range(params.n_layers):
-            self.layers.append(TransformerBlock(layer_id, params))
+        # 只初始化需要的 transformer 层，注意params.n_layers指的就是transformer层，而非total_layers
+        # 取max是为了跳过embedding层，取min是为了跳过norm和lm_head层。range函数取右开区间所以这样做确实是
+        # 将layer_id设置为transformer层的id，而非整体的id
+        if end_layer_idx != 0 and start_layer_idx < total_layers - 2:
+            for layer_id in range(max(1, start_layer_idx) - 1, min(end_layer_idx, params.n_layers + 1)):
+                self.layers.append(TransformerBlock(layer_id, params)) # 注意这里的layer_id就是transformer层的id
 
-        self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-        self.output = Linear(
-            params.dim, params.vocab_size, bias=False,
-        )
+        self.norm = None
+        if start_layer_idx <= total_layers - 2 and end_layer_idx >= total_layers - 2: # norm 层在最后一个 transformer 层之后
+            self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+
+        self.output = None
+        if end_layer_idx >= total_layers - 1: # lm_head 层在 norm 层之后
+            self.output = Linear(
+                params.dim, params.vocab_size, bias=False,
+            )
 
         self.freqs_cis = precompute_freqs_cis(
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
         )
+        
+    
 
+    # 现在是一次性地将输入数据传递通过整个Transformer模型的所有层
+    # 应该改为只执行模型的一部分，并返回中间结果，以便下一层进行处理
+    # @torch.inference_mode()
+    # def origin_forward(self, tokens: torch.Tensor, start_pos: int):
+    #     _bsz, seqlen = tokens.shape
+    #     h = self.tok_embeddings(tokens)
+    #     self.freqs_cis = self.freqs_cis.to(h.device)
+    #     freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+
+    #     mask = None
+    #     if seqlen > 1:
+    #         mask = torch.full(
+    #             (1, 1, seqlen, seqlen), float("-inf"), device=tokens.device
+    #         )
+    #         mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
+
+    #     for layer in self.layers:
+    #         h = layer(h, start_pos, freqs_cis, mask)
+    #     h = self.norm(h)
+    #     output = self.output(h).float()
+    #     return output
+    
     @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, start_pos: int):
-        _bsz, seqlen = tokens.shape
-        h = self.tok_embeddings(tokens)
+    def forward(
+        self,
+        input_data: torch.Tensor, # 可以是 tokens 或 hidden_states
+        start_pos: int,
+        is_tokens: bool = True, # 指示输入是否为 tokens
+    ):
+        _bsz, seqlen = input_data.shape[:2] # 获取 batch size 和 sequence length
+        h = None
+
+        if is_tokens:
+            if self.tok_embeddings is not None: # 如果 embedding 层存在
+                h = self.tok_embeddings(input_data)
+            else: # 这个分支其实不可能，因为如果输入是tokens，就一定要过embedding层
+                h = torch.zeros(
+                    (_bsz, seqlen, self.params.dim),
+                    dtype=torch.float32,
+                    device=input_data.device,
+                ) # 或者从外部传入
+        else:
+            h = input_data # 直接使用传入的 hidden_states
+
         self.freqs_cis = self.freqs_cis.to(h.device)
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
         mask = None
         if seqlen > 1:
-            mask = torch.full(
-                (1, 1, seqlen, seqlen), float("-inf"), device=tokens.device
+            mask = (
+                torch.full((1, 1, seqlen, seqlen), float("-inf"), device=input_data.device)
             )
             mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
 
-        for layer in self.layers:
+        for layer in self.layers: # Transformer层
             h = layer(h, start_pos, freqs_cis, mask)
-        h = self.norm(h)
-        output = self.output(h).float()
+        if self.norm is not None: # norm层
+            h = self.norm(h)
+        if self.output is not None: # output层
+            output = self.output(h).float()
+        else:
+            output = h.float()
+
         return output
 
 logger = getLogger()
