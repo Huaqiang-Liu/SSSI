@@ -15,38 +15,6 @@ MODEL_DIR = "model/llama2"
 TOKENIZER_PATH = "model/llama2/tokenizer.model"
 
 
-# def origin_load_partitioned_model(model_dir: str, use_gpu=True):
-#     device = torch.device("cuda" if use_gpu else "cpu")
-
-#     # 加载 config
-#     with open(os.path.join(model_dir, "config.json"), "r") as f:
-#         config = json.load(f)
-
-#     model_args = ModelArgs(
-#         dim=config["hidden_size"],
-#         n_layers=config["num_hidden_layers"],
-#         n_heads=config["num_attention_heads"],
-#         n_kv_heads=config.get("num_key_value_heads", config["num_attention_heads"]),
-#         vocab_size=config["vocab_size"],
-#         multiple_of=256,
-#         norm_eps=config["rms_norm_eps"],
-#         max_seq_len=config["max_position_embeddings"],
-#         ffn_dim_multiplier=config["intermediate_size"] / config["hidden_size"]
-#     )
-
-#     model = Transformer(model_args).to(device)
-#     model.eval()
-
-#     # 按层加载参数
-#     model.tok_embeddings.load_state_dict(torch.load(os.path.join(model_dir, "embedding.pt"), map_location=device))
-#     model.norm.load_state_dict(torch.load(os.path.join(model_dir, "norm.pt"), map_location=device))
-#     model.output.load_state_dict(torch.load(os.path.join(model_dir, "lm_head.pt"), map_location=device))
-
-#     for i, layer in enumerate(model.layers):
-#         layer.load_state_dict(torch.load(os.path.join(model_dir, f"layer_{i}.pt"), map_location=device))
-
-#     return model
-
 def load_partitioned_model(model_dir: str, use_gpu: bool, start_layer_idx: int = 0, end_layer_idx: int = -1):
     device = torch.device("cuda" if use_gpu else "cpu")
 
@@ -99,34 +67,6 @@ def load_partitioned_model(model_dir: str, use_gpu: bool, start_layer_idx: int =
 
     return model
 
-
-# # 多token生成
-# def generate(model, tokenizer, prompt, max_new_tokens=64, temperature=0.0, device="cuda"):
-#     model.eval()
-#     input_ids = torch.tensor(
-#         [tokenizer.encode(prompt, bos=True, eos=False)],
-#         dtype=torch.long
-#     ).to(device)
-#     generated = input_ids
-#     start_pos = 0
-
-#     for i in range(max_new_tokens):
-#         logits = model(generated, start_pos=start_pos)
-#         next_token_logits = logits[0, -1, :]  # 最后一个 token 的输出
-#         if temperature == 0.0:
-#             next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-#         else:
-#             probs = torch.softmax(next_token_logits / temperature, dim=-1)
-#             next_token = torch.multinomial(probs, num_samples=1)
-
-#         generated = torch.cat((generated, next_token.unsqueeze(0)), dim=1)
-#         start_pos += 1
-
-#         if next_token.item() == tokenizer.eos_id:  # 去掉函数调用括号
-#             break
-
-#     output_text = tokenizer.decode(generated[0].tolist())
-#     return output_text
 
 # 比上面的generate看着短是因为generate是多token生成，这个只需要单token
 @torch.no_grad()
@@ -236,32 +176,15 @@ def generate(
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
-
-    # Initialize tokenizer
-    try:
-        # Assuming Tokenizer class is correctly imported from llama_model.py
-        tokenizer = Tokenizer(model_path=TOKENIZER_PATH)
-    except FileNotFoundError:
-        print(f"Error: Tokenizer model not found at {TOKENIZER_PATH}. Please check the path.")
-        sys.exit(1)
-    except NameError:
-         print(f"Error: Tokenizer class not found. Make sure llama_model.py is accessible and defines Tokenizer.")
-         sys.exit(1)
-    except Exception as e:
-         print(f"An unexpected error occurred while initializing tokenizer: {e}")
-         sys.exit(1)
-
-
+    tokenizer = Tokenizer(model_path=TOKENIZER_PATH)
     input_text = "How many states does the US have?"
     max_gen_tokens = 64
-    temp = 0.0 # Use greedy sampling for testing
+    temp = 0.0
 
     print(f"\nInput prompt: '{input_text}'")
     print(f"Max new tokens: {max_gen_tokens}")
     print(f"Temperature: {temp}")
 
-
-    # Call the generate function that simulates partitioned inference
     output = generate(
         tokenizer=tokenizer,
         prompt=input_text,

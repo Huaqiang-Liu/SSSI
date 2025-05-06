@@ -44,7 +44,7 @@ def write_ret_uint8(shm, value): # value是uint8类型，可以传入int，这�
     shm[READ_RET_OFFSET:READ_RET_OFFSET + 1] = value.to_bytes(1, 'little')
 
 def clear_shm(shm): # 清空共享内存
-    shm[LOCK_OFFSET + 1:] = bytearray(len(shm) - 1) # 将返回内容（start_pos）一并删除
+    shm[READ_RET_OFFSET + 1:] = bytearray(len(shm) - 1)
 
 
 # 一层的输出->字节

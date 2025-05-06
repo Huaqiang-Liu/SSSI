@@ -1,7 +1,0 @@
-{
-  "role": "guest",
-  "model_name": "gpt2",
-  "layers": ["1.pt", "2.pt", "11.pt", "12.pt"],
-  "start_first": false,
-  "shm_path": "/sys/bus/pci/devices/0000:00:02.0/resource2"
-}

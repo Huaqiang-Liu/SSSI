@@ -10,7 +10,7 @@ import sys
 # from ..core import ivshmem_comm as ic
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 import core.ivshmem_comm as ic
-import inference_engine as ie
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
