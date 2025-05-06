@@ -272,7 +272,7 @@ class Transformer(nn.Module):
         # 取max是为了跳过embedding层，取min是为了跳过norm和lm_head层。range函数取右开区间所以这样做确实是
         # 将layer_id设置为transformer层的id，而非整体的id
         if end_layer_idx != 0 and start_layer_idx < total_layers - 2:
-            for layer_id in range(max(1, start_layer_idx) - 1, min(end_layer_idx, params.n_layers + 1)):
+            for layer_id in range(max(1, start_layer_idx) - 1, min(end_layer_idx, params.n_layers)):
                 self.layers.append(TransformerBlock(layer_id, params)) # 注意这里的layer_id就是transformer层的id
 
         self.norm = None

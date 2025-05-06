@@ -3,7 +3,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Literal, Optional, Tuple, TypedDict
 from pdb import set_trace as st
-from llama_model import *
+if not __package__:
+    project_root = str(Path(__file__).resolve().parent.parent)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+from core.llama_model import ModelArgs, Transformer, Tokenizer
 import sentencepiece as spm
 from safetensors.torch import load_file as safe_load
 
