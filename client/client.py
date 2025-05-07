@@ -9,7 +9,7 @@ import torch
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 import core.ivshmem_comm as ic
 import core.inference_engine as ie
-from core.llama_model import Tokenizer, ModelArgs # 假设 Tokenizer 和 ModelArgs 在 llama_model.py 中
+from core.llama_model import Tokenizer
 
 TOKENIZER_PATH = "model/llama2/tokenizer.model"
 
@@ -51,7 +51,7 @@ def run_inference(config: dict, prompt: str = None):
     print(f"[{role.upper()}] 加载模型分区...")
     for layer_range in layers_to_inference:
         start_idx = layer_range[0]
-        end_idx = layer_range[-1] # 列表中的最后一个元素是结束索引，索引得到的文件是all_model_files[i]
+        end_idx = layer_range[-1]
         print(f"[{role.upper()}] 加载层范围 {start_idx} 到 {end_idx}，闭区间")
         partition = ie.load_partitioned_model(
             model_dir=model_dir,
@@ -84,6 +84,7 @@ def run_inference(config: dict, prompt: str = None):
 
     # 存储已生成的 token ID (只有负责最后解码的一端，即开始推理的一端需要完整序列)
     generated_ids = None
+    last_output_tensor = None # 第一批层，开始端也是结束端，非第一轮的情况，输入的tensor是上一轮的输出tensor，保存于此
 
     # 启动方清空共享内存中的返回标记，将start_pos初始化为0，准备开始推理，将输入prompt编码成token ids
     if is_initiator:
@@ -120,12 +121,14 @@ def run_inference(config: dict, prompt: str = None):
 
         current_partition_input = None
         is_tokens_input_for_block = False
-        hidden_state_before_head_for_local_save = None
-
 
         for i, (start_idx, end_idx, partition) in enumerate(model_partitions):
             print(f"[{role.upper()}] 处理分配的第 {i+1}/{len(model_partitions)} 个分区块 (层 {start_idx} 到 {end_idx}).")
 
+            # 输入的分类讨论：
+            # 第一批层，开始端，第一轮，输入是编码的token
+            # 第一批层，开始端也是结束端，非第一轮，输入是上一轮保存的变量tensor。TODO: 疑点是这个tensor到底是什么？？？？？？
+            # 否则从ivshmem读取
             if i == 0:
                 if current_start_pos == 0:
                     if is_initiator:
@@ -134,33 +137,48 @@ def run_inference(config: dict, prompt: str = None):
                 else:
                     is_tokens_input_for_block = False
                     if is_initiator and is_ender:
-                        current_partition_input = output_tensor_from_prev_round
+                        current_partition_input = last_output_tensor
                         print(f"[{role.upper()}] 轮次 {current_start_pos}, 使用本地存储的 tensor 作为第一个分区块输入.")
                     else:
                         print(f"[{role.upper()}] 轮次 {current_start_pos}, 从SHM读取第一个分区块输入 tensor.")
-                        blocks = ic.read_blocks(shm)
+                        blocks = None
+                        # 等待上一轮的结尾发来它的输出，即本轮的输入tensor
+                        while blocks is None:
+                            blocks = ic.read_blocks(shm)
+                            time.sleep(0.001)
                         current_partition_input = ic.deserialize_tensor(ic.assemble_blocks(blocks), use_gpu=(device.type == "cuda"))
             else:
                 is_tokens_input_for_block = False
                 print(f"[{role.upper()}] 从SHM读取第 {i+1} 个分区块输入 tensor.")
-                blocks = ic.read_blocks(shm)
+                blocks = None
+                while blocks is None:
+                    blocks = ic.read_blocks(shm)
+                    time.sleep(0.001)
                 current_partition_input = ic.deserialize_tensor(ic.assemble_blocks(blocks), use_gpu=(device.type == "cuda"))
 
+            # 推理得到输出
             if current_partition_input is not None:
                 current_partition_input = current_partition_input.to(device)
-
+            else:
+                raise ValueError(f"[{role.upper()}] 无法读取分区块输入 tensor.")
+            print(f"[{role.upper()}] 分区块输入 tensor 形状: {current_partition_input.shape}")
             output_tensor = partition(current_partition_input, current_start_pos, is_tokens=is_tokens_input_for_block)
 
-            if is_initiator and is_ender and end_idx == total_layers - 2:
-                hidden_state_before_head_for_local_save = output_tensor
-                print(f"[{role.upper()}] (Initiator+Ender) 存储隐藏状态 (层 {end_idx}) 本地。")
+            # 推完这一批层之后的分类讨论：
+            # 如果这是本端最后一批层
+            #   如果是结束端（即推完了最后一层），负责生成下一个token
+            #     如果是启动端，说明不用ivshmem传送，将下一轮的开头需要的输入保存在本地变量中即可
+            #     如果不是启动端，将下一轮的开头需要的输入写入ivshmem
+            # 否则（不是本端最后一批层，或者是本端最后一批层，但本端不是结束端），将输出tensor写入ivshmem
+            # 注意：下一轮的开头需要的输入不一定是本端的输出tensor（我还不知道具体是什么，TODO）
+            is_last_partition = (i == len(model_partitions) - 1)
+            if is_last_partition:
+                # 这是本端处理的最后一个 Partition Block
+                final_output_from_side = output_tensor
 
-
-            is_last_partition_block_on_side = (i == len(model_partitions) - 1)
-
-            if is_last_partition_block_on_side:
                 if is_ender:
-                    next_token_logits = output_tensor[0, -1, :]
+                    last_output_tensor = final_output_from_side
+                    next_token_logits = final_output_from_side[0, -1, :] # 假设输出形状是 (batch_size, seq_len, vocab_size)
 
                     if temperature == 0.0:
                         next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
@@ -171,61 +189,31 @@ def run_inference(config: dict, prompt: str = None):
                     next_token_id = next_token.item()
                     print(f"[{role.upper()}] 生成 token ID: {next_token_id}")
 
+                    # 更新 start_pos 在 SHM 中，通知下一轮推理开始
                     ic.write_ret_uint8(shm, current_start_pos + 1)
                     print(f"[{role.upper()}] 将 start_pos 设置为 {current_start_pos + 1} 并写入 SHM.")
 
+                    # 检查停止
                     if tokenizer is not None and next_token_id == tokenizer.eos_id:
                         print(f"[{role.upper()}] 停止推理。原因: 检测到 EOS token。")
-                        break
+                        break # Break the outer loop
                     if current_start_pos + 1 >= max_tokens:
                         print(f"[{role.upper()}] 停止推理。原因: 达到 max_tokens。")
-                        break
+                        break # Break the outer loop
 
                     if is_initiator:
-                        if generated_ids is None:
-                            generated_ids = []
-                        generated_ids.append(next_token_id)
-                        if is_ender:
-                             output_tensor_from_prev_round = hidden_state_before_head_for_local_save
-                             print(f"[{role.upper()}] 是启动方且是结束方，存储隐藏状态本地用于下一轮。")
+                        
                     else:
-                        print(f"[{role.upper()}] 是结束方但不是启动方，将最终输出 tensor (logits) 写入 SHM。")
-                        serialized_output = ic.serialize_tensor(output_tensor)
-                        output_blocks = ic.split_tensor_bytes(serialized_output, msg_id=current_start_pos)
-                        ic.write_blocks(shm, output_blocks)
 
-                elif not is_ender:
-                    print(f"[{role.upper()}] 不是结束方，将最终输出 tensor 写入 SHM。")
-                    serialized_output = ic.serialize_tensor(output_tensor)
-                    output_blocks = ic.split_tensor_bytes(serialized_output, msg_id=current_start_pos)
-                    ic.write_blocks(shm, output_blocks)
+            if not is_last_partition or (is_last_partition and not is_ender):
 
-                break
 
-            else:
-                print(f"[{role.upper()}] 不是最后一个分区块，将中间输出 tensor 写入 SHM。")
-                serialized_output = ic.serialize_tensor(output_tensor)
-                output_blocks = ic.split_tensor_bytes(serialized_output, msg_id=current_start_pos)
-                ic.write_blocks(shm, output_blocks)
-
-        if 'next_token_id' in locals() and ( (tokenizer is not None and next_token_id == tokenizer.eos_id) or current_start_pos + 1 >= max_tokens ):
-             break
+    # 大循环结束，解码并输出
 
     print(f"\n[{role.upper()}] 主推理循环结束.")
 
+    # 如果当前端是启动方，解码并输出最终结果
     if is_initiator and generated_ids is not None and tokenizer is not None:
-        print(f"[{role.upper()}] 解码最终结果...")
-        final_output_ids = []
-        if prompt is not None:
-             input_ids_for_decoding = tokenizer.encode(prompt, bos=True, eos=False)
-             final_output_ids.extend(input_ids_for_decoding)
-
-        final_output_ids.extend(generated_ids)
-
-        output_text = tokenizer.decode(final_output_ids)
-        print("\n--- Final Output ---")
-        print(f"[{role.upper()}] Decoded: {output_text}")
-
 
 
 # 客户端入口点

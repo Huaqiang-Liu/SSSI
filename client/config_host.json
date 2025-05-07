@@ -2,12 +2,6 @@
   "role": "host",
   "model_name": "llama2",
   "partition_model_dir" : "model/llama2-partitioned/",
-  "all_model_files": [
-    "embedding.pt", "layer_0.pt", "layer_1.pt", "layer_2.pt", "layer_3.pt", "layer_4.pt", "layer_5.pt",
-    "layer_6.pt", "layer_7.pt", "layer_8.pt", "layer_9.pt", "layer_10.pt", "layer_11.pt", "layer_12.pt",
-    "layer_13.pt", "layer_14.pt", "layer_15.pt", "layer_16.pt", "layer_17.pt", "layer_18.pt", "layer_19.pt",
-    "layer_20.pt", "layer_21.pt", "norm.pt", "lm_head.pt"
-  ],
   "max_tokens": 64,
   "layers_to_inference": [[2,3,4,5,6,7,8,9,10,11,12,13], [17,18,19,20,21,22,23,24]],
   "shm_path": "/dev/shm/shm1",
