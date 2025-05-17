@@ -121,22 +121,25 @@ class Attention(nn.Module):
             bias=False,
         )
 
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.cache_k = torch.zeros(
             (
                 args.max_batch_size,
                 args.max_seq_len,
                 self.n_local_kv_heads,
                 self.head_dim,
-            )
-        ).cuda()
+            ),
+            device=device
+        )
         self.cache_v = torch.zeros(
             (
                 args.max_batch_size,
                 args.max_seq_len,
                 self.n_local_kv_heads,
                 self.head_dim,
-            )
-        ).cuda()
+            ),
+            device=device
+        )
 
     def forward(
         self,
@@ -318,20 +321,12 @@ class Transformer(nn.Module):
         self,
         input_data: torch.Tensor, # 可以是 tokens 或 hidden_states
         start_pos: int,
-        is_tokens: bool = True, # 指示输入是否为 tokens
     ):
         _bsz, seqlen = input_data.shape[:2] # 获取 batch size 和 sequence length
         h = None
 
-        if is_tokens:
-            if self.tok_embeddings is not None: # 如果 embedding 层存在
-                h = self.tok_embeddings(input_data)
-            else: # 这个分支其实不可能，因为如果输入是tokens，就一定要过embedding层
-                h = torch.zeros(
-                    (_bsz, seqlen, self.params.dim),
-                    dtype=torch.float32,
-                    device=input_data.device,
-                ) # 或者从外部传入
+        if self.tok_embeddings is not None: # 如果 embedding 层存在
+            h = self.tok_embeddings(input_data)
         else:
             h = input_data # 直接使用传入的 hidden_states
 

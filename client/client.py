@@ -28,6 +28,17 @@ def load_config(role: str):
 
     return config
 
+# 测试：层间通信延迟
+# 由于host和guest的交流方式仅能通过ivshmem，测量该指标的方法是：一端传输开始时和另一端传输结束时，向log.txt中写入
+# 绝对时间戳（单位为秒，保留4位小数，写入之后加一个空格），最后将两端的时间戳合并排序，将相邻的时间戳两两相减，得到
+# 的时间差即为每次传输的延迟。为此，对推理的设置采用极端的方式：推理从guest开始，每一端只推理一层。每8轮（即8个输出
+# token）统计一次层间延迟，从而也能观察推理进行到不同阶段，对层间传输延迟的影响。
+def write_timestamp(start_pos):
+    if start_pos % 8 == 0:
+        with open("log.txt", "a") as f:
+            timestamp = time.time()
+            f.write(f"{timestamp:.4f} ")
+
 # 主要推理逻辑。参数config是client目录下的config_host.json或config_guest.json
 def run_inference(config: dict, prompt: str = None):
     role = config["role"]
@@ -80,140 +91,132 @@ def run_inference(config: dict, prompt: str = None):
     tokenizer = None
     if is_initiator or is_ender:
         tokenizer = Tokenizer(model_path=TOKENIZER_PATH)
-    print(f"[{role.upper()}] 进入主推理循环，使用READ_RET_OFFSET作为当前推理的start_pos的同步标记")
+    print(f"[{role.upper()}] 准备进入主推理循环，使用READ_RET_OFFSET作为当前推理的start_pos的同步标记")
 
     # 存储已生成的 token ID (只有负责最后解码的一端，即开始推理的一端需要完整序列)
     generated_ids = None
-    last_output_tensor = None # 第一批层，开始端也是结束端，非第一轮的情况，输入的tensor是上一轮的输出tensor，保存于此
 
     # 启动方清空共享内存中的返回标记，将start_pos初始化为0，准备开始推理，将输入prompt编码成token ids
+    start_time = None
+    end_time = None
     if is_initiator:
+        ic.clear_shm(shm)
         ic.write_ret_uint8(shm, 0)
         if prompt is not None:
-            print(f"[{role.upper()}] 编码输入提示: {prompt}")
-            input_ids = tokenizer.encode(prompt)
-            prompt_token_ids = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0).to(device)
-            print(f"[{role.upper()}] 输入提示编码为 token IDs: {input_ids}")
+            print(f"[{role.upper()}] 编码prompt: {prompt}")
+            prompt_token_ids = torch.tensor(
+                [tokenizer.encode(prompt, bos=True, eos=False)],
+                dtype=torch.long,
+                device=device
+            )
+        start_time = time.time()
 
-    '''
-    完成推理的主循环：
-    最外层循环的含义是：生成一个token循环一次，即走完所有层之后得到一个输出token
-    如果start_pos是0，说明是第一轮推理，负责第一层的模型会将输入的prompt转化为token ids
-    如果start_pos不是0，说明是后续的推理，负责第一层的模型会将上一次的输出token ids作为输入
-        循环读取共享内存中的start_pos，判断是否需要继续推理。如果读出来的就等于start_pos，说明上一次的推理已经完成了（这个在第一层的边界条件也成立，因为最初读出的start_pos就是0）。
-        读数与start_pos相同时，如果是开始端，就读共享内存（除非既是开始端又是结束端，这种情况输入直接保存在变量中），拿出里面的内容再转换得到tensor，开始下一轮推理。
-        得到输入后，就是是内层循环，遍历model_partitions。
-        每一批层推完后，就发到共享内存中，等待另一端接收，然后开始轮询共享内存，等待对面推理完下一批层返回的结果。
-        如果推完model_partitions[-1]也没到结尾（即结尾由另一端推理，直接看is_ender，是False就是这种情况），跟其它批次层一样，发结果到共享内存去。
-        如果推完最后一层（is_ender为True）并将结果和start_pos+1写入共享内存后
-            如果是开始端，就不用ivshmem传送了（特别注意！！因为此时就是结束端，然后又是开始端），直接保存中间结果tensor进下一层主循环
-            否则，将结果tensor写入共享内存，等待另一端读取
-        退出内层循环，在is_initiator and not is_ender的情况下，读取共享内存中另一端返回的结果tensor，作为下一轮推理的输入
-    退出最外层循环后，搞上面的“推结尾”分类讨论。如果是开始端，将结果解码，得到自然语言的推理结果
-    '''
     for current_start_pos in range(max_tokens):
         print(f"\n[{role.upper()}] === 开始处理 token {current_start_pos} (start_pos = {current_start_pos}) ===")
 
         if is_initiator:
             while ic.read_ret_uint8(shm) != current_start_pos:
                 time.sleep(0.001)
-            print(f"[{role.upper()}] 轮次 {current_start_pos}, 检测到同步信号.")
+            print(f"[{role.upper()}] 检测到同步信号")
 
         current_partition_input = None
-        is_tokens_input_for_block = False
 
         for i, (start_idx, end_idx, partition) in enumerate(model_partitions):
-            print(f"[{role.upper()}] 处理分配的第 {i+1}/{len(model_partitions)} 个分区块 (层 {start_idx} 到 {end_idx}).")
+            print(f"[{role.upper()}] 处理分配的第 {i+1}/{len(model_partitions)} 个批次 (层 {start_idx} 到 {end_idx}).")
 
             # 输入的分类讨论：
             # 第一批层，开始端，第一轮，输入是编码的token
-            # 第一批层，开始端也是结束端，非第一轮，输入是上一轮保存的变量tensor。TODO: 疑点是这个tensor到底是什么？？？？？？
+            # 第一批层，开始端也是结束端，非第一轮，输入是上一轮保存的变量tensor，即generated_ids
             # 否则从ivshmem读取
-            if i == 0:
-                if current_start_pos == 0:
-                    if is_initiator:
-                        current_partition_input = prompt_token_ids
-                        is_tokens_input_for_block = True
-                else:
-                    is_tokens_input_for_block = False
-                    if is_initiator and is_ender:
-                        current_partition_input = last_output_tensor
-                        print(f"[{role.upper()}] 轮次 {current_start_pos}, 使用本地存储的 tensor 作为第一个分区块输入.")
-                    else:
-                        print(f"[{role.upper()}] 轮次 {current_start_pos}, 从SHM读取第一个分区块输入 tensor.")
-                        blocks = None
-                        # 等待上一轮的结尾发来它的输出，即本轮的输入tensor
-                        while blocks is None:
-                            blocks = ic.read_blocks(shm)
-                            time.sleep(0.001)
-                        current_partition_input = ic.deserialize_tensor(ic.assemble_blocks(blocks), use_gpu=(device.type == "cuda"))
+            if i == 0 and is_initiator and current_start_pos == 0:
+                current_partition_input = prompt_token_ids
+            elif i == 0 and is_initiator and is_ender and current_start_pos > 0:
+                current_partition_input = generated_ids
+                print(f"[{role.upper()}] 使用本地存储的tensor作为第一个批次输入")
             else:
-                is_tokens_input_for_block = False
-                print(f"[{role.upper()}] 从SHM读取第 {i+1} 个分区块输入 tensor.")
-                blocks = None
-                while blocks is None:
-                    blocks = ic.read_blocks(shm)
+                print(f"[{role.upper()}] 从SHM读取第{i}个批次输入tensor")
+                blocks = []
+                while len(blocks) == 0:
+                    blocks = ic.read_blocks(shm, role)
                     time.sleep(0.001)
-                current_partition_input = ic.deserialize_tensor(ic.assemble_blocks(blocks), use_gpu=(device.type == "cuda"))
+                # 读取完了再写时间戳
+                # write_timestamp(current_start_pos)
+                current_partition_input = ic.deserialize_tensor(ic.assemble_blocks(blocks))
 
             # 推理得到输出
             if current_partition_input is not None:
                 current_partition_input = current_partition_input.to(device)
             else:
-                raise ValueError(f"[{role.upper()}] 无法读取分区块输入 tensor.")
-            print(f"[{role.upper()}] 分区块输入 tensor 形状: {current_partition_input.shape}")
-            output_tensor = partition(current_partition_input, current_start_pos, is_tokens=is_tokens_input_for_block)
+                raise ValueError(f"[{role.upper()}] 无法读取批次输入tensor")
+            print(f"[{role.upper()}] 批次输入tensor形状: {current_partition_input.shape}")
+            output_tensor = partition(current_partition_input, current_start_pos)
 
             # 推完这一批层之后的分类讨论：
-            # 如果这是本端最后一批层
-            #   如果是结束端（即推完了最后一层），负责生成下一个token
+            # 如果这是本端最后一批层，且本端是结束端（即推完了最后一层），负责生成下一个token
             #     如果是启动端，说明不用ivshmem传送，将下一轮的开头需要的输入保存在本地变量中即可
             #     如果不是启动端，将下一轮的开头需要的输入写入ivshmem
             # 否则（不是本端最后一批层，或者是本端最后一批层，但本端不是结束端），将输出tensor写入ivshmem
-            # 注意：下一轮的开头需要的输入不一定是本端的输出tensor（我还不知道具体是什么，TODO）
+            # 注意：下一轮的开头需要的输入是generated_ids，本端的输出tensor是output，要区分
             is_last_partition = (i == len(model_partitions) - 1)
-            if is_last_partition:
-                # 这是本端处理的最后一个 Partition Block
-                final_output_from_side = output_tensor
+            if is_last_partition and is_ender:
+                print(f"[{role.upper()}] 处理完全局最后一层")
+                # 生成下一个token，更新generated_ids
+                logits = output_tensor[0, -1, :] # 假设输出形状是 (batch_size, seq_len, vocab_size)
+                if temperature == 0.0:
+                    next_token = torch.argmax(logits, dim=-1, keepdim=True)
+                else:
+                    probs = torch.softmax(logits / temperature, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                if generated_ids is None:
+                    generated_ids = next_token.unsqueeze(0)
+                else:
+                    generated_ids = torch.cat((generated_ids, next_token.unsqueeze(0)), dim=1)
+                
+                print(f"[{role.upper()}] generated_ids形状: {generated_ids.shape}")
+                if is_initiator:
+                    pass # 已经保存到generated_ids了
+                else:
+                    serialized = ic.serialize_tensor(generated_ids)
+                    blocks = ic.split_tensor_bytes(serialized, msg_id=current_start_pos + 1)
+                    # write_timestamp(current_start_pos)
+                    ic.write_blocks(shm, blocks, role)
+                    print(f"[{role.upper()}] 将generated_ids写入SHM")
 
-                if is_ender:
-                    last_output_tensor = final_output_from_side
-                    next_token_logits = final_output_from_side[0, -1, :] # 假设输出形状是 (batch_size, seq_len, vocab_size)
-
-                    if temperature == 0.0:
-                        next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-                    else:
-                        probs = torch.softmax(next_token_logits / temperature, dim=-1)
-                        next_token = torch.multinomial(probs, num_samples=1)
-
-                    next_token_id = next_token.item()
-                    print(f"[{role.upper()}] 生成 token ID: {next_token_id}")
-
-                    # 更新 start_pos 在 SHM 中，通知下一轮推理开始
-                    ic.write_ret_uint8(shm, current_start_pos + 1)
-                    print(f"[{role.upper()}] 将 start_pos 设置为 {current_start_pos + 1} 并写入 SHM.")
-
-                    # 检查停止
-                    if tokenizer is not None and next_token_id == tokenizer.eos_id:
-                        print(f"[{role.upper()}] 停止推理。原因: 检测到 EOS token。")
-                        break # Break the outer loop
-                    if current_start_pos + 1 >= max_tokens:
-                        print(f"[{role.upper()}] 停止推理。原因: 达到 max_tokens。")
-                        break # Break the outer loop
-
-                    if is_initiator:
-                        
-                    else:
+                # 写ic.READ_RET_OFFSET这个字节，通知下一轮的开始端（无论是不是本端都要写）开始推理
+                ic.write_ret_uint8(shm, current_start_pos + 1)
 
             if not is_last_partition or (is_last_partition and not is_ender):
+                print(f"[{role.upper()}] 还没完，将output tensor写入SHM")
+                serialized = ic.serialize_tensor(output_tensor)
+                blocks = ic.split_tensor_bytes(serialized, msg_id=current_start_pos + 1)
+                # write_timestamp(current_start_pos)
+                ic.write_blocks(shm, blocks, role)
 
-
-    # 大循环结束，解码并输出
-
-    print(f"\n[{role.upper()}] 主推理循环结束.")
-
-    # 如果当前端是启动方，解码并输出最终结果
-    if is_initiator and generated_ids is not None and tokenizer is not None:
+    # 大循环结束后的分类讨论：
+    # 如果是开始端，解码并输出；如果不是开始端，就不用负责最终的解码输出
+    # 最终generated_ids的来源：
+    #   如果是结束端（即又是开始端又是结束端），generated_ids就在本地变量
+    #   如果不是结束端，从ivshmem读取generated_ids
+    print(f"\n[{role.upper()}] 主推理循环结束")
+    if is_initiator and tokenizer is not None:
+        last_output_tensor = None
+        if is_ender:
+            print(f"[{role.upper()}] 直接使用本地generated_ids进行解码")
+            last_output_tensor = generated_ids
+        else:
+            print(f"[{role.upper()}] 从SHM读取最终结果token IDs进行解码")
+            blocks = []
+            while len(blocks) == 0:
+                blocks = ic.read_blocks(shm, role)
+                time.sleep(0.001)
+            # 读取完了再写时间戳
+            # write_timestamp(current_start_pos)
+            last_output_tensor = ic.deserialize_tensor(ic.assemble_blocks(blocks))
+        decoded_ids = last_output_tensor.squeeze(0).tolist()
+        output_text = tokenizer.decode(decoded_ids)
+        print(f"\n[{role.upper()}] 解码结果: {output_text}")
+        end_time = time.time()
+        print(f"[{role.upper()}] 推理时间: {end_time - start_time:.4f}秒")
 
 
 # 客户端入口点
@@ -227,7 +230,6 @@ if __name__ == "__main__":
     client_config = load_config(client_role)
     inference_prompt = "How many states does the US have?" if client_config["layers_to_inference"][0][0] == 0 else None
 
-    # 运行推理
     run_inference(client_config, prompt=inference_prompt)
 
-    print(f"[{client_role.upper()}] 客户端退出.")
+    print(f"[{client_role.upper()}] 客户端退出")

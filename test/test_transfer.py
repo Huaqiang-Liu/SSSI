@@ -39,7 +39,7 @@ def test_guest_ivshmem(shm_path):
         shm = mmap.mmap(f.fileno(), 16 * 1024 * 1024)
 
         print("[Guest] Sending tensor to host...")
-        ic.write_blocks(shm, blocks)
+        ic.write_blocks(shm, blocks, "host")
 
         print("[Guest] Waiting for host to return tensor...")
         returned_blocks = []
@@ -80,7 +80,7 @@ def test_host_ivshmem(shm_path):
         serialized = ic.serialize_tensor(tensor)
         blocks = ic.split_tensor_bytes(serialized, msg_id=ic.get_msg_id(blocks[0])+1)
         
-        ic.write_blocks(shm, blocks)
+        ic.write_blocks(shm, blocks, "host")
         print("[Host] Tensor sent back.")
 
 def main():

@@ -3,7 +3,8 @@
   "model_name": "llama2",
   "partition_model_dir" : "model/llama2-partitioned/",
   "max_tokens": 64,
-  "layers_to_inference": [[0,1], [14,15,16]],
+  "deprecated_layers_to_inference": [[0,1], [14,15,16]],
+  "layers_to_inference": [[0,24]],
   "shm_path": "/sys/bus/pci/devices/0000:00:02.0/resource2",
   "temperature": 0.0
 }

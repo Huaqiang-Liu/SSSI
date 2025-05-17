@@ -74,9 +74,9 @@ def load_partitioned_model(model_dir: str, use_gpu: bool, start_layer_idx: int =
 
 # 比上面的generate看着短是因为generate是多token生成，这个只需要单token
 @torch.no_grad()
-def inference_partition(model: Transformer, input_tensor: torch.Tensor, start_pos: int, is_tokens: bool) -> torch.Tensor:
+def inference_partition(model: Transformer, input_tensor: torch.Tensor, start_pos: int) -> torch.Tensor:
     model.eval()
-    output_tensor = model(input_tensor, start_pos=start_pos, is_tokens=is_tokens)
+    output_tensor = model(input_tensor, start_pos=start_pos)
     return output_tensor
 
 # 测试函数，调用inference_partition来多token生成，仍然命名为generate，但是含义跟之前的全流程推理的generate不是一个东西
@@ -87,7 +87,8 @@ def generate(
     model_dir: str = PAR_MODEL_DIR,
     max_new_tokens: int = 64,
     temperature: float = 0.0,
-    device: str = "cuda"
+    device: str = "cuda",
+    second_start_idx: int = 0
 ) -> str:
     current_device = torch.device(device)
     try:
@@ -114,19 +115,26 @@ def generate(
     # 里面装满了model，现在的情况是一层一个model
     layer_partitions = []
     print(f"Loading {TOTAL_MODEL_LAYERS} individual layers as partitions from {model_dir}...")
-    for i in range(TOTAL_MODEL_LAYERS):
+    
+    # 先加载大块的n，然后再+1+1...
+    layer_partitions.append(
+        load_partitioned_model(
+            model_dir=model_dir,
+            use_gpu=(current_device.type == "cuda"),
+            start_layer_idx=0,
+            end_layer_idx=second_start_idx - 1
+        )
+    )
+    for i in range(second_start_idx, TOTAL_MODEL_LAYERS): # second_start_idx∈[1,25]，等于25的时候只有上面的整块模型
         print(f"Loading layer {i} as partition...")
-        try:
-            partition = load_partitioned_model(
-                model_dir=model_dir,
-                use_gpu=(current_device.type == "cuda"),
-                start_layer_idx=i,
-                end_layer_idx=i
-            )
-            layer_partitions.append(partition)
-        except Exception as e:
-            print(f"Failed to load layer {i}: {e}")
-            return f"Error loading model layer {i}."
+        partition = load_partitioned_model(
+            model_dir=model_dir,
+            use_gpu=(current_device.type == "cuda"),
+            start_layer_idx=i,
+            end_layer_idx=i
+        )
+        layer_partitions.append(partition)
+
 
     input_ids = torch.tensor(
         [tokenizer.encode(prompt, bos=True, eos=False)],
@@ -137,20 +145,17 @@ def generate(
     start_pos = 0
 
     print("\nStarting multi-token generation simulation...")
+    start_time = time.time()
     for _ in range(max_new_tokens):
         input_for_layer = generated_ids
-        is_tokens_for_layer = True
         for i, partition in enumerate(layer_partitions):
             output_of_layer = inference_partition(
                 model=partition,
                 input_tensor=input_for_layer,
-                start_pos=start_pos,
-                is_tokens=is_tokens_for_layer
+                start_pos=start_pos
             )
             # 这一层的输出作为下一层的输入
             input_for_layer = output_of_layer
-            is_tokens_for_layer = False
-
         # 最后一层的输出
         logits = input_for_layer
 
@@ -174,6 +179,10 @@ def generate(
             break
 
     output_text = tokenizer.decode(generated_ids[0].tolist())
+    end_time = time.time()
+    # 将时间差（秒）保留4位小数保存到log.txt中
+    with open("log.txt", "a") as log_file:
+        log_file.write(f"{(end_time - start_time):.4f} ")
     return output_text
 
 
@@ -189,14 +198,17 @@ if __name__ == "__main__":
     print(f"Max new tokens: {max_gen_tokens}")
     print(f"Temperature: {temp}")
 
-    output = generate(
-        tokenizer=tokenizer,
-        prompt=input_text,
-        model_dir=PAR_MODEL_DIR,
-        max_new_tokens=max_gen_tokens,
-        temperature=temp,
-        device=device
-    )
+    for second_start_idx in range(1, 25 + 1):
+        output = generate(
+            tokenizer=tokenizer,
+            prompt=input_text,
+            model_dir=PAR_MODEL_DIR,
+            max_new_tokens=max_gen_tokens,
+            temperature=temp,
+            device=device,
+            second_start_idx=second_start_idx
+        )
+        time.sleep(10)
 
     print("\n--- Generated Output ---")
     print("Decoded:", output)
