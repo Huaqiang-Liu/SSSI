@@ -1,10 +1,11 @@
+
+
 {
   "role": "guest",
-  "model_name": "llama2",
-  "partition_model_dir" : "model/llama2-partitioned/",
+  "model_name": "llama3-1b",
+  "partition_model_dir" : "model/llama-3-1b-instruct/",
   "max_tokens": 64,
-  "deprecated_layers_to_inference": [[0,1], [14,15,16]],
-  "layers_to_inference": [[0,24]],
+  "layers_to_inference": [[0,0], [4,5]],
   "shm_path": "/sys/bus/pci/devices/0000:00:02.0/resource2",
   "temperature": 0.0
 }

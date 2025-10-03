@@ -5,13 +5,16 @@ from pathlib import Path
 import os
 import mmap
 import torch
+import argparse
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 import core.ivshmem_comm as ic
 import core.inference_engine as ie
-from core.llama_model import Tokenizer
+from transformers import AutoTokenizer
 
-TOKENIZER_PATH = "model/llama2/tokenizer.model"
+
+from pdb import set_trace as st
+
 
 # 加载模型配置
 def load_config(role: str):
@@ -39,197 +42,145 @@ def write_timestamp(start_pos):
             timestamp = time.time()
             f.write(f"{timestamp:.4f} ")
 
-# 主要推理逻辑。参数config是client目录下的config_host.json或config_guest.json
-def run_inference(config: dict, prompt: str = None):
+
+def run_inference(config: dict, prompt: str = None, args=None):
     role = config["role"]
     model_dir = config["partition_model_dir"]
     layers_to_inference = config["layers_to_inference"]
     shm_path = config["shm_path"]
-    max_tokens = config.get("max_tokens", 64) # 默认 max_tokens 为 64
-    temperature = config.get("temperature", 0.0) # 默认 temperature 为 0.0
+    max_tokens = config.get("max_tokens", 64)
+    temperature = config.get("temperature", 0.0)
 
     device = torch.device("cuda" if role == "host" and torch.cuda.is_available() else "cpu")
     print(f"[{role.upper()}] 使用设备: {device}")
 
-    # 获取所需读取的模型信息，包括总层数。model_config由模型方提供
     model_config_path = os.path.join(model_dir, "config.json")
     with open(model_config_path, "r") as f:
         model_config = json.load(f)
-    total_layers = model_config.get("num_hidden_layers", 0) + 3
-
-    # 加载本端负责的所有模型分区
-    model_partitions = []
-    print(f"[{role.upper()}] 加载模型分区...")
-    for layer_range in layers_to_inference:
-        start_idx = layer_range[0]
-        end_idx = layer_range[-1]
-        print(f"[{role.upper()}] 加载层范围 {start_idx} 到 {end_idx}，闭区间")
-        partition = ie.load_partitioned_model(
-            model_dir=model_dir,
-            use_gpu=(device.type == "cuda"),
-            start_layer_idx=start_idx,
-            end_layer_idx=end_idx
-        )
-        model_partitions.append((start_idx, end_idx, partition))
+    total_layers = model_config.get("num_hidden_layers", 0)
 
     with open(shm_path, "r+b") as f:
         shm = mmap.mmap(f.fileno(), 16 * 1024 * 1024)
 
-    # 如果本端负责第一层 (Embedding)，则由本端启动第一轮推理
-    is_initiator = layers_to_inference[0][0] == 0
-    is_ender = layers_to_inference[-1][-1] == total_layers - 1
-    if is_initiator:
-        print(f"[{role.upper()}] 是启动方，负责第一批层的推理")
-    else:
-        print(f"[{role.upper()}] 是被动方，等待第一批层推理完之后的返回tensor")
-    if is_ender:
-        print(f"[{role.upper()}] 是结束方，负责最后一批层的推理")
-    else:
-        print(f"[{role.upper()}] 不是结束方")
+    if role == "host":
+        # host加载全部普通层
+        print(f"[HOST] 加载所有普通层...")
+        partition = ie.load_partitioned_model(
+            model_dir=model_dir,
+            use_gpu=True,
+            start_layer_idx=0,
+            end_layer_idx=total_layers - 1
+        )
 
-    # 只有处理prompt的一端需要初始化Tokenizer
-    tokenizer = None
-    if is_initiator or is_ender:
-        tokenizer = Tokenizer(model_path=TOKENIZER_PATH)
-    print(f"[{role.upper()}] 准备进入主推理循环，使用READ_RET_OFFSET作为当前推理的start_pos的同步标记")
+        tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    # 存储已生成的 token ID (只有负责最后解码的一端，即开始推理的一端需要完整序列)
-    generated_ids = None
-
-    # 启动方清空共享内存中的返回标记，将start_pos初始化为0，准备开始推理，将输入prompt编码成token ids
-    start_time = None
-    end_time = None
-    if is_initiator:
         ic.clear_shm(shm)
         ic.write_ret_uint8(shm, 0)
-        if prompt is not None:
-            print(f"[{role.upper()}] 编码prompt: {prompt}")
-            prompt_token_ids = torch.tensor(
-                [tokenizer.encode(prompt, bos=True, eos=False)],
-                dtype=torch.long,
-                device=device
-            )
+
+        print(f"[HOST] 编码prompt: {prompt}")
+        inputs = tokenizer(prompt, return_tensors="pt")
+        input_ids = inputs.input_ids.to(device)
+        attention_mask = inputs.attention_mask.to(device)
+        past_key_values = None
+        generated_ids = [input_ids]
         start_time = time.time()
 
-    for current_start_pos in range(max_tokens):
-        print(f"\n[{role.upper()}] === 开始处理 token {current_start_pos} (start_pos = {current_start_pos}) ===")
+        for current_pos in range(max_tokens):
+            print(f"\n[HOST] === Token {current_pos} ===")
+            hidden_states = input_ids if current_pos == 0 else next_token
+            for layer_idx in range(total_layers):
+                # 判断该层是否有LoRA（即是否在guest的layers_to_inference中）
+                lora_layer = any(layer_idx in rng for rng in layers_to_inference)
+                lora_output = None
+                if lora_layer:
+                    print(f"[HOST] 层{layer_idx}包含LoRA，发送给guest...")
+                    # 发送hidden_states到guest
+                    data_to_send = {'hidden_states': hidden_states.cpu()}
+                    serialized = ic.serialize_tensor(data_to_send)
+                    blocks = ic.split_tensor_bytes(serialized, msg_id=current_pos * 1000 + layer_idx)
+                    ic.write_blocks(shm, blocks, "host")
+                # host立即进行普通层推理
+                with torch.no_grad():
+                    outputs = partition(
+                        inputs_embeds=hidden_states,
+                        attention_mask=attention_mask,
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                        layer_idx=layer_idx
+                    )
+                host_output = outputs.last_hidden_state
+                past_key_values = outputs.past_key_values
+                # 如果有LoRA层，等待guest返回结果并相加
+                if lora_layer:
+                    returned_blocks = []
+                    while True:
+                        returned_blocks = ic.read_blocks(shm, "host")
+                        if len(returned_blocks) > 0 and ic.get_msg_id(returned_blocks[0]) == current_pos * 1000 + layer_idx + 1:
+                            break
+                        time.sleep(0.001)
+                    returned_bytes = ic.assemble_blocks(returned_blocks)
+                    data = ic.deserialize_tensor(returned_bytes)
+                    lora_output = data['hidden_states'].to(device)
+                    print(f"[HOST] 收到guest返回的LoRA结果，进行相加")
+                    hidden_states = host_output + lora_output
+                else:
+                    hidden_states = host_output
 
-        if is_initiator:
-            while ic.read_ret_uint8(shm) != current_start_pos:
-                time.sleep(0.001)
-            print(f"[{role.upper()}] 检测到同步信号")
-
-        current_partition_input = None
-
-        for i, (start_idx, end_idx, partition) in enumerate(model_partitions):
-            print(f"[{role.upper()}] 处理分配的第 {i+1}/{len(model_partitions)} 个批次 (层 {start_idx} 到 {end_idx}).")
-
-            # 输入的分类讨论：
-            # 第一批层，开始端，第一轮，输入是编码的token
-            # 第一批层，开始端也是结束端，非第一轮，输入是上一轮保存的变量tensor，即generated_ids
-            # 否则从ivshmem读取
-            if i == 0 and is_initiator and current_start_pos == 0:
-                current_partition_input = prompt_token_ids
-            elif i == 0 and is_initiator and is_ender and current_start_pos > 0:
-                current_partition_input = generated_ids
-                print(f"[{role.upper()}] 使用本地存储的tensor作为第一个批次输入")
+            # 生成下一个token
+            logits = hidden_states[:, -1, :]
+            if temperature == 0.0:
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
             else:
-                print(f"[{role.upper()}] 从SHM读取第{i}个批次输入tensor")
-                blocks = []
-                while len(blocks) == 0:
-                    blocks = ic.read_blocks(shm, role)
-                    time.sleep(0.001)
-                # 读取完了再写时间戳
-                # write_timestamp(current_start_pos)
-                current_partition_input = ic.deserialize_tensor(ic.assemble_blocks(blocks))
+                probs = torch.softmax(logits / temperature, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            generated_ids.append(next_token)
+            attention_mask = torch.cat([attention_mask, torch.ones((attention_mask.shape[0], 1), device=device, dtype=torch.long)], dim=1)
+            input_ids = next_token
 
-            # 推理得到输出
-            if current_partition_input is not None:
-                current_partition_input = current_partition_input.to(device)
-            else:
-                raise ValueError(f"[{role.upper()}] 无法读取批次输入tensor")
-            print(f"[{role.upper()}] 批次输入tensor形状: {current_partition_input.shape}")
-            output_tensor = partition(current_partition_input, current_start_pos)
-
-            # 推完这一批层之后的分类讨论：
-            # 如果这是本端最后一批层，且本端是结束端（即推完了最后一层），负责生成下一个token
-            #     如果是启动端，说明不用ivshmem传送，将下一轮的开头需要的输入保存在本地变量中即可
-            #     如果不是启动端，将下一轮的开头需要的输入写入ivshmem
-            # 否则（不是本端最后一批层，或者是本端最后一批层，但本端不是结束端），将输出tensor写入ivshmem
-            # 注意：下一轮的开头需要的输入是generated_ids，本端的输出tensor是output，要区分
-            is_last_partition = (i == len(model_partitions) - 1)
-            if is_last_partition and is_ender:
-                print(f"[{role.upper()}] 处理完全局最后一层")
-                # 生成下一个token，更新generated_ids
-                logits = output_tensor[0, -1, :] # 假设输出形状是 (batch_size, seq_len, vocab_size)
-                if temperature == 0.0:
-                    next_token = torch.argmax(logits, dim=-1, keepdim=True)
-                else:
-                    probs = torch.softmax(logits / temperature, dim=-1)
-                    next_token = torch.multinomial(probs, num_samples=1)
-                if generated_ids is None:
-                    generated_ids = next_token.unsqueeze(0)
-                else:
-                    generated_ids = torch.cat((generated_ids, next_token.unsqueeze(0)), dim=1)
-                
-                print(f"[{role.upper()}] generated_ids形状: {generated_ids.shape}")
-                if is_initiator:
-                    pass # 已经保存到generated_ids了
-                else:
-                    serialized = ic.serialize_tensor(generated_ids)
-                    blocks = ic.split_tensor_bytes(serialized, msg_id=current_start_pos + 1)
-                    # write_timestamp(current_start_pos)
-                    ic.write_blocks(shm, blocks, role)
-                    print(f"[{role.upper()}] 将generated_ids写入SHM")
-
-                # 写ic.READ_RET_OFFSET这个字节，通知下一轮的开始端（无论是不是本端都要写）开始推理
-                ic.write_ret_uint8(shm, current_start_pos + 1)
-
-            if not is_last_partition or (is_last_partition and not is_ender):
-                print(f"[{role.upper()}] 还没完，将output tensor写入SHM")
-                serialized = ic.serialize_tensor(output_tensor)
-                blocks = ic.split_tensor_bytes(serialized, msg_id=current_start_pos + 1)
-                # write_timestamp(current_start_pos)
-                ic.write_blocks(shm, blocks, role)
-
-    # 大循环结束后的分类讨论：
-    # 如果是开始端，解码并输出；如果不是开始端，就不用负责最终的解码输出
-    # 最终generated_ids的来源：
-    #   如果是结束端（即又是开始端又是结束端），generated_ids就在本地变量
-    #   如果不是结束端，从ivshmem读取generated_ids
-    print(f"\n[{role.upper()}] 主推理循环结束")
-    if is_initiator and tokenizer is not None:
-        last_output_tensor = None
-        if is_ender:
-            print(f"[{role.upper()}] 直接使用本地generated_ids进行解码")
-            last_output_tensor = generated_ids
-        else:
-            print(f"[{role.upper()}] 从SHM读取最终结果token IDs进行解码")
-            blocks = []
-            while len(blocks) == 0:
-                blocks = ic.read_blocks(shm, role)
-                time.sleep(0.001)
-            # 读取完了再写时间戳
-            # write_timestamp(current_start_pos)
-            last_output_tensor = ic.deserialize_tensor(ic.assemble_blocks(blocks))
-        decoded_ids = last_output_tensor.squeeze(0).tolist()
-        output_text = tokenizer.decode(decoded_ids)
-        print(f"\n[{role.upper()}] 解码结果: {output_text}")
         end_time = time.time()
-        print(f"[{role.upper()}] 推理时间: {end_time - start_time:.4f}秒")
+        print(f"[HOST] 推理时间: {end_time - start_time:.4f}秒")
+        full_sequence = torch.cat(generated_ids, dim=1)
+        output_text = tokenizer.decode(full_sequence[0], skip_special_tokens=True)
+        print(f"\n[HOST] 解码结果: {output_text}")
+
+    elif role == "guest":
+        # guest只负责LoRA层推理
+        print(f"[GUEST] 等待host发送LoRA层输入...")
+        while True:
+            blocks = ic.read_blocks(shm, "guest")
+            if len(blocks) > 0:
+                msg_id = ic.get_msg_id(blocks[0])
+                layer_idx = msg_id % 1000
+                # 判断是否为本端负责的LoRA层
+                lora_layer = any(layer_idx in rng for rng in layers_to_inference)
+                if lora_layer:
+                    print(f"[GUEST] 收到host发来的LoRA层{layer_idx}输入")
+                    serialized = ic.assemble_blocks(blocks)
+                    data = ic.deserialize_tensor(serialized)
+                    hidden_states = data['hidden_states']
+                    # LoRA层推理（此处用简单操作模拟）
+                    lora_output = hidden_states * 2  # 实际应为LoRA层forward
+                    data_to_send = {'hidden_states': lora_output}
+                    serialized = ic.serialize_tensor(data_to_send)
+                    blocks = ic.split_tensor_bytes(serialized, msg_id=msg_id + 1)
+                    ic.write_blocks(shm, blocks, "guest")
+                    print(f"[GUEST] LoRA层{layer_idx}结果已返回host")
+            time.sleep(0.001)
 
 
 # 客户端入口点
 if __name__ == "__main__":
-    # 从命令行参数获取角色 (host 或 guest)
-    if len(sys.argv) != 2 or sys.argv[1] not in ["host", "guest"]:
-        print("使用方法: 在项目根目录python client/client.py [host|guest]")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Client for Model Inference")
+    parser.add_argument("--role", choices=["host", "guest"], help="Role of the client (host or guest)")
+    parser.add_argument("--model_name", type=str, default="LLM-Research/Llama-3.2-1B-Instruct", choices=['LLM-Research/Llama-3.2-1B-Instruct','LLM-Research/Llama-3.2-3B', 'LLM-Research/Meta-Llama-3-8B'], help="Model name for inference")
+    args = parser.parse_args()
 
-    client_role = sys.argv[1]
+    client_role = args.role
     client_config = load_config(client_role)
     inference_prompt = "How many states does the US have?" if client_config["layers_to_inference"][0][0] == 0 else None
 
-    run_inference(client_config, prompt=inference_prompt)
+    run_inference(client_config, prompt=inference_prompt, args=args)
 
     print(f"[{client_role.upper()}] 客户端退出")

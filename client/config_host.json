@@ -1,10 +1,9 @@
 {
   "role": "host",
-  "model_name": "llama2",
-  "partition_model_dir" : "model/llama2-partitioned/",
+  "model_name": "llama3-1b",
+  "partition_model_dir" : "model/llama-3-1b-instruct/",
   "max_tokens": 64,
-  "deprecated_layers_to_inference": [[2,3,4,5,6,7,8,9,10,11,12,13], [17,18,19,20,21,22,23,24]],
-  "layers_to_inference": [[23,24]],
+  "layers_to_inference": [[0, 15]],
   "shm_path": "/dev/shm/shm1",
   "temperature": 0.0
 }

@@ -10,14 +10,97 @@ if not __package__:
 from core.llama_model import ModelArgs, Transformer, Tokenizer
 import sentencepiece as spm
 from safetensors.torch import load_file as safe_load
+from torch.nn import Linear 
 
-from transformers import AutoTokenizer, AutoModelForCausalLM
-
+from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaModel
+from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.cache_utils import Cache, DynamicCache
+from transformers.models.llama.modeling_llama import create_causal_mask
 
 PAR_MODEL_DIR = "model/llama2-partitioned"
 MODEL_DIR = "model/llama2"
 TOKENIZER_PATH = "model/llama2/tokenizer.model"
 
+class SliceLinear(Linear):
+    def __init__(self, in_features, out_features, bias=True, device=None, dtype=None):
+        super().__init__(in_features, out_features, bias=bias, device=device, dtype=dtype)
+    
+
+class SubModel(LlamaModel):
+    def __init__(self, base_model: LlamaModel, start: int, end: int):
+        super().__init__(base_model.config)
+        self.load_state_dict(base_model.state_dict())
+        self.start = start
+        self.end = end
+        self.to(base_model.device, dtype=base_model.dtype)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        **kwargs,
+    ):
+        # 如果是第一个分区，处理 input_ids
+        if self.start == 0:
+            if (input_ids is None) ^ (inputs_embeds is not None):
+                raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+            if inputs_embeds is None:
+                inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
+        
+        hidden_states = inputs_embeds
+
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache(config=self.config)
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position: torch.Tensor = torch.arange(
+                past_seen_tokens, past_seen_tokens + hidden_states.shape[1], device=hidden_states.device
+            )
+
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        causal_mask = create_causal_mask(
+            config=self.config,
+            input_embeds=hidden_states,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+        )
+        
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        # 选择要执行的层
+        layers_to_run = self.layers[self.start:self.end] # end is exclusive
+        for layer in layers_to_run:
+            hidden_states = layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+            )
+            if isinstance(hidden_states, tuple):
+                hidden_states = hidden_states[0]
+
+        # 根据 end 决定是否使用 norm
+        if self.end == len(self.layers):
+            hidden_states = self.norm(hidden_states)
+            
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values,
+        )
 
 def load_partitioned_model(model_dir: str, use_gpu: bool, start_layer_idx: int = 0, end_layer_idx: int = -1):
     device = torch.device("cuda" if use_gpu else "cpu")
@@ -41,33 +124,37 @@ def load_partitioned_model(model_dir: str, use_gpu: bool, start_layer_idx: int =
     total_layers = model_args.n_layers + 3  # 从config中获取总transformer层数，+3得到总层数
     if end_layer_idx == -1:
         end_layer_idx = total_layers - 1
-
-    model = Transformer(model_args, start_layer_idx, end_layer_idx, total_layers).to(device)
+        
+    model = AutoModelForCausalLM.from_pretrained("model/llama-3-1b-instruct/", device_map="auto", torch_dtype=torch.bfloat16)
+    model = model.to(device)
+    model.model = SubModel(model.model, start=start_layer_idx, end=end_layer_idx)  # 只使用第1到18层
+    #model.model = model.model.to(model.device)
+    print(f"Model loaded successfully")
     model.eval()
 
-    # 加载参数
-    if model.tok_embeddings is not None:
-        model.tok_embeddings.load_state_dict(
-            torch.load(os.path.join(model_dir, "embedding.pt"), map_location=device)
-        )
-    if model.norm is not None:
-        model.norm.load_state_dict(
-            torch.load(os.path.join(model_dir, "norm.pt"), map_location=device)
-        )
+    # # 加载参数
+    # if model.tok_embeddings is not None:
+    #     model.tok_embeddings.load_state_dict(
+    #         torch.load(os.path.join(model_dir, "embedding.pt"), map_location=device)
+    #     )
+    # if model.norm is not None:
+    #     model.norm.load_state_dict(
+    #         torch.load(os.path.join(model_dir, "norm.pt"), map_location=device)
+    #     )
 
-    if model.output is not None:
-        model.output.load_state_dict(
-            torch.load(os.path.join(model_dir, "lm_head.pt"), map_location=device)
-        )
+    # if model.output is not None:
+    #     model.output.load_state_dict(
+    #         torch.load(os.path.join(model_dir, "lm_head.pt"), map_location=device)
+    #     )
 
-    if len(model.layers) > 0:
-        first_global_transformer_idx = max(1, start_layer_idx) - 1 # layer_0的这个值就是0
-        for i, layer in enumerate(model.layers):
-            # 当前 layer 在全局 Transformer 序列中的索引
-            global_transformer_idx = first_global_transformer_idx + i
-            layer.load_state_dict(
-                torch.load(os.path.join(model_dir, f"layer_{global_transformer_idx}.pt"), map_location=device)
-            )
+    # if len(model.layers) > 0:
+    #     first_global_transformer_idx = max(1, start_layer_idx) - 1 # layer_0的这个值就是0
+    #     for i, layer in enumerate(model.layers):
+    #         # 当前 layer 在全局 Transformer 序列中的索引
+    #         global_transformer_idx = first_global_transformer_idx + i
+    #         layer.load_state_dict(
+    #             torch.load(os.path.join(model_dir, f"layer_{global_transformer_idx}.pt"), map_location=device)
+    #         )
 
     return model
 
@@ -81,7 +168,7 @@ def inference_partition(model: Transformer, input_tensor: torch.Tensor, start_po
 
 # 测试函数，调用inference_partition来多token生成，仍然命名为generate，但是含义跟之前的全流程推理的generate不是一个东西
 @torch.no_grad()
-def generate(
+def generate_test(
     tokenizer: Tokenizer,
     prompt: str,
     model_dir: str = PAR_MODEL_DIR,
@@ -199,7 +286,7 @@ if __name__ == "__main__":
     print(f"Temperature: {temp}")
 
     for second_start_idx in range(1, 25 + 1):
-        output = generate(
+        output = generate_test(
             tokenizer=tokenizer,
             prompt=input_text,
             model_dir=PAR_MODEL_DIR,

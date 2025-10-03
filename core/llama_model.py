@@ -122,6 +122,7 @@ class Attention(nn.Module):
         )
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        #device = torch.device("cpu")
         self.cache_k = torch.zeros(
             (
                 args.max_batch_size,
@@ -292,8 +293,6 @@ class Transformer(nn.Module):
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
         )
         
-    
-
     # 现在是一次性地将输入数据传递通过整个Transformer模型的所有层
     # 应该改为只执行模型的一部分，并返回中间结果，以便下一层进行处理
     # @torch.inference_mode()
