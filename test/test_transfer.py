@@ -31,7 +31,7 @@ def test_guest_ivshmem(shm_path):
     print("[Guest] Tensor generated.")
     start = time.time()
     serialized = ic.tensor2bytes(tensor)
-    blocks = ic.bytes2blocks(serialized, msg_id=1)
+    blocks = ic.tensor_bytes_and_module_name2blocks(serialized, msg_id=1)
 
     with open(shm_path, "r+b") as f:
         shm = mmap.mmap(f.fileno(), 16 * 1024 * 1024)
@@ -48,7 +48,7 @@ def test_guest_ivshmem(shm_path):
             else:
                 print("[Guest] No data received yet. Waiting...")
                 time.sleep(0.01)
-        returned_bytes = ic.blocks2bytes(returned_blocks)
+        returned_bytes = ic.blocks2tensor_bytes_and_module_name(returned_blocks)
         returned_tensor = ic.bytes2tensor(returned_bytes)
         print("[Guest] Tensor received and reconstructed.")
         end = time.time()
@@ -70,13 +70,13 @@ def test_host_ivshmem(shm_path):
                 time.sleep(0.01)
         
         print("[Host] Tensor received. Deserialize and load to GPU...")
-        serialized = ic.blocks2bytes(blocks)
+        serialized = ic.blocks2tensor_bytes_and_module_name(blocks)
         tensor = ic.bytes2tensor(serialized)
         tensor = tensor.cuda()
         print("[Host] Tensor loaded to GPU. Unload and send back to guest...")
         tensor = tensor.cpu()
         serialized = ic.tensor2bytes(tensor)
-        blocks = ic.bytes2blocks(serialized, msg_id=ic.get_msg_id(blocks[0])+1)
+        blocks = ic.tensor_bytes_and_module_name2blocks(serialized, msg_id=ic.get_msg_id(blocks[0])+1)
         
         ic.write_blocks(shm, blocks, "host")
         print("[Host] Tensor sent back.")
@@ -109,7 +109,7 @@ def test_lora(shm_path):
                     print("[Guest] No data received yet. Waiting...")
                     time.sleep(0.01)
             print("[Guest] Tensor1 received. Deserialize and load to GPU...")
-            serialized = ic.blocks2bytes(blocks)
+            serialized = ic.blocks2tensor_bytes_and_module_name(blocks)
             tensor1 = ic.bytes2tensor(serialized)
             print("[Guest] Tensor1 loaded to GPU.")
 
@@ -117,7 +117,7 @@ def test_lora(shm_path):
             tensor2 = tensor1 * 2  # 模拟lora层操作
             tensor2 = tensor2.cpu()
             serialized = ic.tensor2bytes(tensor2)
-            blocks = ic.bytes2blocks(serialized, msg_id=2)
+            blocks = ic.tensor_bytes_and_module_name2blocks(serialized, msg_id=2)
 
             print("[Guest] Sending tensor2 back to host...")
             ic.write_blocks(shm, blocks, "guest")
@@ -128,7 +128,7 @@ def test_lora(shm_path):
             tensor1 = torch.randn(1024, 1024).half()
             print("[Host] Tensor1 generated.")
             serialized = ic.tensor2bytes(tensor1)
-            blocks = ic.bytes2blocks(serialized, msg_id=1)
+            blocks = ic.tensor_bytes_and_module_name2blocks(serialized, msg_id=1)
 
             print("[Host] Sending tensor1 to guest...")
             ic.write_blocks(shm, blocks, "host")
@@ -144,7 +144,7 @@ def test_lora(shm_path):
                     print("[Host] No data received yet. Waiting...")
                     time.sleep(0.01)
             print("[Host] Tensor2 received. Deserialize and load to GPU...")
-            serialized = ic.blocks2bytes
+            serialized = ic.blocks2tensor_bytes_and_module_name
         else:
             print("未知shm路径")
             return

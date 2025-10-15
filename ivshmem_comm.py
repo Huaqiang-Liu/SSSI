@@ -75,7 +75,7 @@ def tensor2bytes(tensor: torch.Tensor) -> bytes:
 
 
 # 产生header+字节+可选模块名称（host发送给guest时需要指定推理哪的lora层，反之只用发tensor）->blocks
-def bytes2blocks(tensor_bytes: bytes, msg_id: int, module_name: str = '') -> list:
+def tensor_bytes_and_module_name2blocks(tensor_bytes: bytes, msg_id: int, module_name: str = '') -> list:
     blocks = []
     total_data = {
         'tensor': tensor_bytes,
@@ -101,7 +101,7 @@ def bytes2blocks(tensor_bytes: bytes, msg_id: int, module_name: str = '') -> lis
     return blocks
 
 # blocks->tensor的字节序列和module_name
-def blocks2bytes(blocks: list) -> tuple:
+def blocks2tensor_bytes_and_module_name(blocks: list) -> tuple:
     # 按seq_id排序
     blocks.sort(key=lambda b: struct.unpack('<H', b[4:6])[0])
     payloads = [b[HEADER_SIZE:HEADER_SIZE + struct.unpack('<H', b[7:9])[0]] for b in blocks]
@@ -206,23 +206,55 @@ def read_blocks(shm, role):
 
 
 
-
+# 初始化时guest用来反序列化得到lora相关权重或配置字节序列的函数，和针对tensor的处理区分开
 # 从完整模型中提取lora权重，获取lora配置，序列化权重和配置
 def lora_weight_config2bytes(model):
     lora_state_dict = {}
     for name, param in model.named_parameters():
         if 'lora_' in name:
-            # 我们只关心和 lora 相关的参数
-            lora_state_dict[name] = param.cpu().clone() # 克隆到CPU，避免GPU相关问题
-    lora_config = model.peft_config['default'].to_dict() # adapter 名为 'default'
-    # 序列化权重
+            lora_state_dict[name] = param.cpu().clone()
+    lora_config = model.peft_config['default'].to_dict()
+
+    # 遍历配置字典，将所有set类型转换为list类型，否则json序列化会报错
+    for key, value in lora_config.items():
+        if isinstance(value, set):
+            lora_config[key] = list(value)
+
     buffer = io.BytesIO()
     torch.save(lora_state_dict, buffer)
     lora_weights_bytes = buffer.getvalue()
 
-    # 序列化配置
     lora_config_bytes = json.dumps(lora_config).encode('utf-8')
+    # 打印两个字节序列的大小（单位为KB）
+    print(f"LoRA weights size: {len(lora_weights_bytes) / 1024:.2f} KB")
+    print(f"LoRA config size: {len(lora_config_bytes) / 1024:.2f} KB")
     return lora_weights_bytes, lora_config_bytes
+
+# 由于将lora权重和配置一次传输，所以第一批（权重）的块不能设置is_last=1，需要特判
+def bytes2blocks(data_bytes: bytes, msg_id: int, force_is_not_last: bool=False) -> list:
+    blocks = []
+    total_len = len(data_bytes)
+    num_blocks = (total_len + PAYLOAD_SIZE - 1) // PAYLOAD_SIZE
+
+    for seq_id in range(num_blocks):
+        start = seq_id * PAYLOAD_SIZE
+        end = min(start + PAYLOAD_SIZE, total_len)
+        payload = data_bytes[start:end]
+        payload_len = len(payload)
+        is_last = 1 if seq_id == num_blocks - 1 and force_is_not_last is False else 0
+
+        header = struct.pack(BLOCK_HEADER_FORMAT, msg_id, seq_id, is_last, payload_len)
+        assert len(header) == HEADER_SIZE, 'Header must be exactly 9 bytes'
+        blocks.append(header + payload)
+
+    return blocks
+
+def blocks2bytes(blocks: list) -> bytes:
+    # 按seq_id排序
+    blocks.sort(key=lambda b: struct.unpack('<H', b[4:6])[0])
+    payloads = [b[HEADER_SIZE:HEADER_SIZE + struct.unpack('<H', b[7:9])[0]] for b in blocks]
+    payload_bytes = b''.join(payloads)
+    return payload_bytes
 
 def bytes2lora_weight_config(lora_weights_bytes, lora_config_bytes):
     # 反序列化权重
@@ -248,7 +280,7 @@ if __name__ == '__main__':
         print("===== GPU Test =====")
         gpu_tensor = torch.randn(100, 100, 100).cuda()
         gpu_bytes = tensor2bytes(gpu_tensor)
-        gpu_blocks = bytes2blocks(gpu_bytes, 3)
-        gpu_assembled = blocks2bytes(gpu_blocks)
+        gpu_blocks = tensor_bytes_and_module_name2blocks(gpu_bytes, 3)
+        gpu_assembled = blocks2tensor_bytes_and_module_name(gpu_blocks)
         gpu_reconstructed = bytes2tensor(gpu_assembled, use_gpu=True)
         print(f"GPU tensor shape after round trip: {gpu_reconstructed.shape}")

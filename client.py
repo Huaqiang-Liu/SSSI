@@ -11,18 +11,6 @@ LORA_MODEL_DIR = "./model/llama-3-1b-lora"
 HOST_SHM_PATH = "/dev/shm/shm1"
 GUEST_SHM_PATH = "/sys/bus/pci/devices/0000:00:02.0/resource2"
 
-# 测试：层间通信延迟
-# 由于host和guest的交流方式仅能通过ivshmem，测量该指标的方法是：一端传输开始时和另一端传输结束时，向log.txt中写入
-# 绝对时间戳（单位为秒，保留4位小数，写入之后加一个空格），最后将两端的时间戳合并排序，将相邻的时间戳两两相减，得到
-# 的时间差即为每次传输的延迟。为此，对推理的设置采用极端的方式：推理从guest开始，每一端只推理一层。每8轮（即8个输出
-# token）统计一次层间延迟，从而也能观察推理进行到不同阶段，对层间传输延迟的影响。
-def write_timestamp(start_pos):
-    if start_pos % 8 == 0:
-        with open("log.txt", "a") as f:
-            timestamp = time.time()
-            f.write(f"{timestamp:.4f} ")
-
-
 # 根据host构建好模型后发来的lora相关权重和配置，初始化guest端的lora层
 class GuestLoraModel:
     def __init__(self, lora_state_dict, lora_config_dict):
@@ -96,39 +84,37 @@ class SliceLinear(LoraLinear):
     LoRA增量的计算则通过ivshmem委托给Guest端。
     """
     def __init__(self, target: LoraLinear, module_name: str, shm):
-        # 初始化父类 LoraLinear。我们只需要它的基本结构和类型信息。
-        # 注意：我们不直接使用父类的forward，但为了对象完整性，需要正确初始化。
+        active_adapter = "default"
+        
+        r_value = target.r[active_adapter]
+        alpha_value = target.lora_alpha[active_adapter]
+        dropout_module = target.lora_dropout[active_adapter]
+        dropout_value = dropout_module.p
+
         super().__init__(
-            target.base_layer.in_features,
-            target.base_layer.out_features,
-            r=target.r,
-            lora_alpha=target.lora_alpha,
-            lora_dropout=target.lora_dropout.p if hasattr(target.lora_dropout, 'p') else 0.0,
+            base_layer=target.base_layer,
+            adapter_name=active_adapter,
+            r=r_value,
+            lora_alpha=alpha_value,
+            lora_dropout=dropout_value,
             fan_in_fan_out=target.fan_in_fan_out,
-            # 其他在你的peft版本中可能需要的参数
         )
 
-        # 关键：用原始层的base_layer替换我们自己的，确保权重和设备都正确
         self.base_layer = target.base_layer
-        
-        # 存储用于与Guest通信所需的信息
         self.module_name = module_name
         self.shm = shm
 
     def forward(self, x: torch.Tensor):
         # 1. 在Host本地计算基础模型的输出
-        # 如果adapter被禁用，则行为与普通线性层完全相同
         if self.disable_adapters or self.active_adapter not in self.lora_A:
             return self.base_layer(x)
 
         result = self.base_layer(x)
 
         # 2. 将LoRA部分的计算外包给Guest
-        # 序列化输入张量，并打包module_name
         tensor_bytes = ic.tensor2bytes(x)
-        # 使用一个唯一的msg_id，例如当前时间戳的整数部分
         msg_id = int(time.time()) 
-        request_blocks = ic.bytes2blocks(tensor_bytes, msg_id=msg_id, module_name=self.module_name)
+        request_blocks = ic.tensor_bytes_and_module_name2blocks(tensor_bytes, msg_id=msg_id, module_name=self.module_name)
         
         # 3. 发送请求到共享内存
         ic.write_blocks(self.shm, request_blocks, "host")
@@ -139,21 +125,18 @@ class SliceLinear(LoraLinear):
             response_blocks = ic.read_blocks(self.shm, "host")
             if len(response_blocks) > 0:
                 break
-            time.sleep(0.001) # 短暂休眠，避免CPU空转
+            time.sleep(0.001)
 
         # 5. 解析响应
-        delta_h_bytes, _ = ic.blocks2bytes(response_blocks)
+        delta_h_bytes, _ = ic.blocks2tensor_bytes_and_module_name(response_blocks)
         delta_h = ic.bytes2tensor(delta_h_bytes, use_gpu=torch.cuda.is_available())
         
         # 6. 合并结果
-        # 确保数据类型和设备一致
         delta_h = delta_h.to(result.device, dtype=result.dtype)
         result += delta_h
         
         return result
 
-
-# peft.tuners.lora.layer.Linear -> SliceLinear
 def replace_lora_layers(model: nn.Module, shm):
     replaced_count = 0
     for name, module in model.named_modules():
@@ -175,7 +158,7 @@ def guest_main():
         shm = mmap.mmap(f.fileno(), 16 * 1024 * 1024)
         while True:
             blocks = ic.read_blocks(shm, "guest")
-            if len(blocks) > 0 and ic.get_msg_id(blocks[0]) == -1:
+            if len(blocks) > 0:
                 split_point = ic.get_msg_id(blocks[0])
                 lora_weight_blocks = blocks[:split_point]
                 lora_config_blocks = blocks[split_point:]
@@ -183,8 +166,10 @@ def guest_main():
             else:
                 time.sleep(0.01)
 
-        serialized_weights, _ = ic.blocks2bytes(lora_weight_blocks)
-        serialized_config, _ = ic.blocks2bytes(lora_config_blocks)
+        serialized_weights = ic.blocks2bytes(lora_weight_blocks)
+        serialized_config = ic.blocks2bytes(lora_config_blocks)
+        print(f"LoRA weights size: {len(serialized_weights) / 1024:.2f} KB")
+        print(f"LoRA config size: {len(serialized_config) / 1024:.2f} KB")
         lora_state_dict, lora_config_dict = ic.bytes2lora_weight_config(serialized_weights, serialized_config)
         guest_lora_model = GuestLoraModel(lora_state_dict, lora_config_dict)
         ic.clear_shm(shm)
@@ -194,7 +179,7 @@ def guest_main():
         while True:
             request_blocks = ic.read_blocks(shm, "guest")
             if len(request_blocks) > 0:
-                tensor_bytes, module_name = ic.blocks2bytes(request_blocks)
+                tensor_bytes, module_name = ic.blocks2tensor_bytes_and_module_name(request_blocks)
                 input_tensor = ic.bytes2tensor(tensor_bytes, use_gpu=False)
                 print(f"[GUEST] Received request for module: {module_name}")
 
@@ -204,7 +189,7 @@ def guest_main():
                 # 准备并发送响应
                 response_bytes = ic.tensor2bytes(delta_h)
                 msg_id = int(time.time())
-                response_blocks = ic.bytes2blocks(response_bytes, msg_id=msg_id)
+                response_blocks = ic.tensor_bytes_and_module_name2blocks(response_bytes, msg_id=msg_id)
                 ic.write_blocks(shm, response_blocks, "guest")
                 print(f"[GUEST] Sent response for module: {module_name}")
             else:
@@ -236,9 +221,10 @@ def host_main():
         # 设计的时候没有考虑两次连续传输的同步问题，而这种情况仅限于一开始的lora权重和配置初始化，所以
         # 这里暂且将两组数据块合并，每个数据块组的msg_id是改组块的数量，方便解包
         lora_weights_block_num = (len(lora_weights_bytes) + ic.PAYLOAD_SIZE - 1) // ic.PAYLOAD_SIZE
-        lora_config_block_num = (len(lora_config_bytes) + ic.PAYLOAD_SIZE - 1) // ic.PAYLOAD_SIZE
-        lora_weight_blocks = ic.bytes2blocks(lora_weights_bytes, msg_id=lora_weights_block_num)
-        lora_config_blocks = ic.bytes2blocks(lora_config_bytes, msg_id=lora_config_block_num)
+        lora_weight_blocks = ic.bytes2blocks(lora_weights_bytes, msg_id=lora_weights_block_num, force_is_not_last=True)
+        lora_config_blocks = ic.bytes2blocks(lora_config_bytes, msg_id=lora_weights_block_num)
+        print(f"msg_id是{lora_weights_block_num}")
+        print(f"两段blocks的长度分别是{len(lora_weight_blocks)}和{len(lora_config_blocks)}")
         # 拼接两组块，发送lora权重和配置
         packed_blocks = lora_weight_blocks + lora_config_blocks
         ic.clear_shm(shm)
@@ -276,28 +262,6 @@ def host_main():
     output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
     print(output_text)
 
-def host_test():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(device)
-    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_DIR)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    base_model = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL_DIR,
-        dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto",
-    )
-    
-    model = PeftModel.from_pretrained(
-        base_model,
-        LORA_MODEL_DIR,
-    )
-    model.eval()
-    for name, module in model.named_modules():
-        if isinstance(module, LoraLinear):
-            print(f"{name}: {module}")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Client for Model Inference")
@@ -306,6 +270,5 @@ if __name__ == "__main__":
     client_role = args.role
     if client_role == "host":
         host_main()
-        # host_test()
     else:
         guest_main()
