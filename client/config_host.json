@@ -1,9 +1,0 @@
-{
-  "role": "host",
-  "model_name": "llama3-1b",
-  "partition_model_dir" : "model/llama-3-1b-instruct/",
-  "max_tokens": 64,
-  "layers_to_inference": [[0, 15]],
-  "shm_path": "/dev/shm/shm1",
-  "temperature": 0.0
-}

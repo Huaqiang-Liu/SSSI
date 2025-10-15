@@ -1,3 +1,4 @@
+import io
 import torch
 import numpy as np
 import json
@@ -28,7 +29,7 @@ MAX_BLOCK_NUM = 4087 # (16*1024*1024 - 1)//BLOCK_SIZE，1是读写锁使用的1�
 
 # <即小端法，I = uint32, H = uint16, B = uint8
 # msg_id uint32 一层输出的所有tensor共用一个msg_id
-# seq_id uint16 该tensor的第几个block
+# seq_id uint16 该序列的第几个block
 # is_last uint8 该block是否是最后一个
 # payload_len uint16 该block的payload长度，上限是4096，所以uint16就够了
 BLOCK_HEADER_FORMAT = '<IHBH'
@@ -61,7 +62,7 @@ def clear_shm(shm): # 清空共享内存
 
 
 # 一层的输出->字节
-def serialize_tensor(tensor: torch.Tensor) -> bytes:
+def tensor2bytes(tensor: torch.Tensor) -> bytes:
     np_array = tensor.detach().cpu().numpy()
     meta = {
         'shape': list(np_array.shape),
@@ -71,33 +72,48 @@ def serialize_tensor(tensor: torch.Tensor) -> bytes:
     meta_len = len(meta_bytes).to_bytes(4, 'little')  # prepend 4-byte length
     return meta_len + meta_bytes + np_array.tobytes()
 
-# 产生header+字节->blocks
-def split_tensor_bytes(serialized: bytes, msg_id: int):
+
+
+# 产生header+字节+可选模块名称（host发送给guest时需要指定推理哪的lora层，反之只用发tensor）->blocks
+def bytes2blocks(tensor_bytes: bytes, msg_id: int, module_name: str = '') -> list:
     blocks = []
-    total_len = len(serialized)
+    total_data = {
+        'tensor': tensor_bytes,
+        'module_name': module_name
+    }
+    buffer = io.BytesIO()
+    torch.save(total_data, buffer)
+    total_data_bytes = buffer.getvalue()
+    total_len = len(total_data_bytes)
     num_blocks = (total_len + PAYLOAD_SIZE - 1) // PAYLOAD_SIZE
 
     for seq_id in range(num_blocks):
         start = seq_id * PAYLOAD_SIZE
         end = min(start + PAYLOAD_SIZE, total_len)
-        payload = serialized[start:end]
+        payload = total_data_bytes[start:end]
         payload_len = len(payload)
         is_last = 1 if seq_id == num_blocks - 1 else 0
 
         header = struct.pack(BLOCK_HEADER_FORMAT, msg_id, seq_id, is_last, payload_len)
-        assert len(header) == HEADER_SIZE, 'Header must be exactly 11 bytes'
+        assert len(header) == HEADER_SIZE, 'Header must be exactly 9 bytes'
         blocks.append(header + payload)
 
     return blocks
 
-# blocks->tensor的字节序列
-def assemble_blocks(blocks: list) -> bytes:
-    blocks.sort(key=lambda b: struct.unpack('<H', b[4:6])[0]) # 按seq_id排序
+# blocks->tensor的字节序列和module_name
+def blocks2bytes(blocks: list) -> tuple:
+    # 按seq_id排序
+    blocks.sort(key=lambda b: struct.unpack('<H', b[4:6])[0])
     payloads = [b[HEADER_SIZE:HEADER_SIZE + struct.unpack('<H', b[7:9])[0]] for b in blocks]
-    return b''.join(payloads)
+    total_data_bytes = b''.join(payloads)
+    buffer = io.BytesIO(total_data_bytes)
+    total_data = torch.load(buffer, map_location='cpu')
+    tensor_bytes = total_data.get('tensor', b'')
+    module_name = total_data.get('module_name', '')
+    return tensor_bytes, module_name
 
 # tensor的字节序列->给下一层的tensor
-def deserialize_tensor(data: bytes, use_gpu: bool = False) -> torch.Tensor:
+def bytes2tensor(data: bytes, use_gpu: bool = False) -> torch.Tensor:
     meta_len = int.from_bytes(data[:4], 'little')
     meta = json.loads(data[4:4+meta_len].decode('utf-8'))
     tensor_data = data[4+meta_len:]
@@ -189,6 +205,36 @@ def read_blocks(shm, role):
         release_lock(shm)
 
 
+
+
+# 从完整模型中提取lora权重，获取lora配置，序列化权重和配置
+def lora_weight_config2bytes(model):
+    lora_state_dict = {}
+    for name, param in model.named_parameters():
+        if 'lora_' in name:
+            # 我们只关心和 lora 相关的参数
+            lora_state_dict[name] = param.cpu().clone() # 克隆到CPU，避免GPU相关问题
+    lora_config = model.peft_config['default'].to_dict() # adapter 名为 'default'
+    # 序列化权重
+    buffer = io.BytesIO()
+    torch.save(lora_state_dict, buffer)
+    lora_weights_bytes = buffer.getvalue()
+
+    # 序列化配置
+    lora_config_bytes = json.dumps(lora_config).encode('utf-8')
+    return lora_weights_bytes, lora_config_bytes
+
+def bytes2lora_weight_config(lora_weights_bytes, lora_config_bytes):
+    # 反序列化权重
+    buffer = io.BytesIO(lora_weights_bytes)
+    lora_state_dict = torch.load(buffer, map_location='cpu')
+
+    # 反序列化配置
+    lora_config = json.loads(lora_config_bytes.decode('utf-8'))
+    return lora_state_dict, lora_config
+
+
+
 if __name__ == '__main__':
     # print("===== CPU Test =====")
     # cpu_tensor = torch.randn(100, 100, 100)
@@ -201,8 +247,8 @@ if __name__ == '__main__':
     if torch.cuda.is_available():
         print("===== GPU Test =====")
         gpu_tensor = torch.randn(100, 100, 100).cuda()
-        gpu_bytes = serialize_tensor(gpu_tensor)
-        gpu_blocks = split_tensor_bytes(gpu_bytes, 3)
-        gpu_assembled = assemble_blocks(gpu_blocks)
-        gpu_reconstructed = deserialize_tensor(gpu_assembled, use_gpu=True)
+        gpu_bytes = tensor2bytes(gpu_tensor)
+        gpu_blocks = bytes2blocks(gpu_bytes, 3)
+        gpu_assembled = blocks2bytes(gpu_blocks)
+        gpu_reconstructed = bytes2tensor(gpu_assembled, use_gpu=True)
         print(f"GPU tensor shape after round trip: {gpu_reconstructed.shape}")
