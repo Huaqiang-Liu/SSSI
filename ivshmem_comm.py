@@ -4,6 +4,7 @@ import numpy as np
 import json
 import struct
 import time
+import ctypes
 
 
 # header，block（header+payload）的定义，序列化和反序列化的函数
@@ -58,7 +59,7 @@ def write_host_guest_uint8(shm, value):
     shm[HOST_GUEST_OFFSET:HOST_GUEST_OFFSET + 1] = value.to_bytes(1, 'little')
 
 def clear_shm(shm): # 清空共享内存
-    shm[HOST_GUEST_OFFSET + 1:] = bytearray(len(shm) - 3)
+    ctypes.memset(ctypes.addressof(ctypes.c_char.from_buffer(shm, HOST_GUEST_OFFSET + 1)), 0, 16)
 
 
 # 一层的输出->字节
@@ -161,20 +162,25 @@ def acquire_lock(shm):
         if shm[LOCK_OFFSET] == 0:
             shm[LOCK_OFFSET] = 1
             break
-        time.sleep(0.001)  # Sleep 1ms to reduce busy-wait
+        time.sleep(0.0001)  # Sleep 1ms to reduce busy-wait
 
 def release_lock(shm):
     shm[LOCK_OFFSET] = 0
 
 
 def write_blocks(shm, blocks, role):
+    clear_shm_start = time.time()
     clear_shm(shm)
+    clear_shm_end = time.time()
+    acquire_lock_begin = time.time()
     acquire_lock(shm)
+    acquire_lock_end = time.time()
     try:
         write_host_guest_uint8(shm, 0 if role == "host" else 1)
         
         offset = HOST_GUEST_OFFSET + 1
         block_count = 0
+        copy_time = 0.0 # 记录复制内存的时间
         for block in blocks:
             if block_count > 0 and block_count % MAX_BLOCK_NUM == 0:
                 # 先清空共享内存
@@ -183,20 +189,31 @@ def write_blocks(shm, blocks, role):
                 time.sleep(1)
                 acquire_lock(shm)
                 offset = HOST_GUEST_OFFSET + 1
+            copy_start = time.time()
             shm[offset:offset+len(block)] = block
+            copy_end = time.time()
+            copy_time += (copy_end - copy_start)
             offset += BLOCK_SIZE
             block_count += 1
+        print(f"{role} 写，获取锁 {acquire_lock_end - acquire_lock_begin:.6f} s，复制内存 {copy_time:.6f} s，清空内存 {clear_shm_end - clear_shm_start:.6f} s")
     finally:
         release_lock(shm)
 
 def read_blocks(shm, role):
+    acquire_lock_begin = time.time()
     acquire_lock(shm)
+    acquire_lock_end = time.time()
     should_clear = True # 空的或没有权限读，就不能清空。只有读到了才能清空
+    have_blocks = False
     try:
         blocks = []
         offset = HOST_GUEST_OFFSET + 1
+        copy_time = 0.0 # 记录复制内存的时间
         while offset + HEADER_SIZE <= len(shm): # 实际上就是offset <= len(shm)，这么写保险些而已（下一行）
+            copy_start = time.time()
             header = shm[offset:offset+HEADER_SIZE]
+            copy_end = time.time()
+            copy_time += (copy_end - copy_start)
             if all(b == 0 for b in header):
                 should_clear = False
                 break
@@ -206,10 +223,14 @@ def read_blocks(shm, role):
             if role == "guest" and read_host_guest_uint8(shm) == 1:
                 should_clear = False
                 break
+            have_blocks = True
             msg_id, seq_id, is_last, payload_len = struct.unpack(BLOCK_HEADER_FORMAT, header)
             payload_start = offset + HEADER_SIZE
             payload_end = payload_start + payload_len
+            copy_start = time.time()
             payload = shm[payload_start:payload_end]
+            copy_end = time.time()
+            copy_time += (copy_end - copy_start)
             full_block = header + payload
             blocks.append(full_block)
             offset += BLOCK_SIZE
@@ -223,6 +244,8 @@ def read_blocks(shm, role):
                     time.sleep(1)
                     acquire_lock(shm)
                     offset = HOST_GUEST_OFFSET + 1
+        if have_blocks:
+            print(f"{role} 读，获取锁 {acquire_lock_end - acquire_lock_begin:.6f} s，复制内存 {copy_time:.6f} s")
         return blocks
     finally:
         if should_clear:

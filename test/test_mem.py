@@ -14,7 +14,7 @@ if __name__ == "__main__":
     else:
         shm_path = GUEST_SHM_PATH
 
-    sizes = [1024 * (2 ** i) for i in range(11)]  # 1KB to 1MB
+    sizes = [1024 * (2 ** i) for i in range(15)]  # 1KB to 16MB
     results = {}
 
     for size in sizes:

@@ -131,7 +131,7 @@ class SliceLinear(LoraLinear):
         self.shm = shm
 
     def forward(self, x: torch.Tensor):
-        print("1. 在Host本地计算基础模型的输出")
+        # print("1. 在Host本地计算基础模型的输出")
         host_start = time.time()
         active_adapters = self.active_adapter if isinstance(self.active_adapter, (list, tuple)) else [self.active_adapter]
 
@@ -143,18 +143,18 @@ class SliceLinear(LoraLinear):
         result = self.base_layer(x)
         host_end = time.time()
 
-        print("2. 将LoRA部分的计算外包给Guest")
+        # print("2. 将LoRA部分的计算外包给Guest")
         tensor_bytes = ic.tensor2bytes(x)
         msg_id = int(time.time()) 
         request_blocks = ic.tensor_bytes_and_module_name2blocks(tensor_bytes, msg_id=0, module_name=self.module_name)
         
-        print("3. 发送请求到共享内存")
+        # print("3. 发送请求到共享内存")
         # print(f"请求包含 {len(request_blocks)} 个块")
         host_write_start = time.time()
         ic.write_blocks(self.shm, request_blocks, "host")
         host_write_end = time.time()
 
-        print("4. 等待并接收Guest的响应")
+        # print("4. 等待并接收Guest的响应")
         response_blocks = []
         host_read_start, host_read_end = 0, 0
         while True:
@@ -165,11 +165,11 @@ class SliceLinear(LoraLinear):
                 break
             time.sleep(0.001)
         # print(f"响应包含 {len(response_blocks)} 个块")
-        print("5. 解析响应")
+        # print("5. 解析响应")
         delta_h_bytes, _ = ic.blocks2tensor_bytes_and_module_name(response_blocks)
         delta_h = ic.bytes2tensor(delta_h_bytes, use_gpu=torch.cuda.is_available())
         
-        print("6. 合并结果")
+        # print("6. 合并结果")
         delta_h = delta_h.to(result.device, dtype=result.dtype)
         result += delta_h
         guest_end = time.time()
@@ -224,7 +224,7 @@ def guest_main():
                 guest_read_end = time.time()
                 tensor_bytes, module_name = ic.blocks2tensor_bytes_and_module_name(request_blocks)
                 input_tensor = ic.bytes2tensor(tensor_bytes, use_gpu=False)
-                print(f"[GUEST] Received request for module: {module_name}")
+                # print(f"[GUEST] Received request for module: {module_name}")
 
                 # 执行LoRA前向传播计算
                 guest_forward_start = time.time()
@@ -237,7 +237,7 @@ def guest_main():
                 guest_write_start = time.time()
                 ic.write_blocks(shm, response_blocks, "guest")
                 guest_write_end = time.time()
-                print(f"[GUEST] Sent response for module: {module_name}")
+                # print(f"[GUEST] Sent response for module: {module_name}")
                 with open("log_guest.txt", "a") as log_f:
                     log_f.write(f"{guest_forward_end - guest_forward_start:.6f} {guest_write_end - guest_write_start:.6f} {guest_read_end - guest_read_start:.6f}\n")
             else:
