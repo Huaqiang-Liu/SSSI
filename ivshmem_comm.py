@@ -63,10 +63,25 @@ def clear_shm(shm): # 清空共享内存
 
 # 一层的输出->字节
 def tensor2bytes(tensor: torch.Tensor) -> bytes:
-    np_array = tensor.detach().cpu().numpy()
+    t = tensor.detach()
+    orig_dtype = str(t.dtype)  # record original torch dtype as string
+
+    # Move to CPU for numpy conversion. If dtype is bfloat16 (unsupported by numpy),
+    # convert to float32 on CPU first.
+    t_cpu = t.cpu()
+    if t_cpu.dtype == torch.bfloat16:
+        # numpy doesn't support bfloat16 -> convert to float32 for storage
+        t_cpu = t_cpu.to(torch.float32)
+        meta_dtype = 'float32'
+    else:
+        # Use numpy-compatible dtype string
+        meta_dtype = str(t_cpu.numpy().dtype)
+
+    np_array = t_cpu.numpy()
     meta = {
         'shape': list(np_array.shape),
-        'dtype': str(np_array.dtype),
+        'dtype': meta_dtype,        # dtype used for the raw bytes (numpy dtype string)
+        'orig_torch_dtype': orig_dtype,  # original torch dtype (e.g. 'torch.bfloat16')
     }
     meta_bytes = json.dumps(meta).encode('utf-8')
     meta_len = len(meta_bytes).to_bytes(4, 'little')  # prepend 4-byte length
@@ -117,10 +132,20 @@ def bytes2tensor(data: bytes, use_gpu: bool = False) -> torch.Tensor:
     meta_len = int.from_bytes(data[:4], 'little')
     meta = json.loads(data[4:4+meta_len].decode('utf-8'))
     tensor_data = data[4+meta_len:]
-    np_array = np.frombuffer(tensor_data, dtype=meta['dtype']).reshape(meta['shape'])
+
+    # Build numpy array from raw bytes
+    np_dtype = meta['dtype']
+    np_array = np.frombuffer(tensor_data, dtype=np_dtype).reshape(meta['shape'])
+    # Create a CPU tensor first
+    t = torch.from_numpy(np_array.copy())
+
+    orig_torch_dtype = meta.get('orig_torch_dtype', None)
+    # If original was bfloat16 and user wants GPU and CUDA available, cast back on GPU
+    if use_gpu and orig_torch_dtype == 'torch.bfloat16' and torch.cuda.is_available():
+        return t.cuda().to(torch.bfloat16)
     if use_gpu:
-        return torch.from_numpy(np_array.copy()).cuda()
-    return torch.from_numpy(np_array.copy())
+        return t.cuda()
+    return t
 
 
 

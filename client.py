@@ -16,39 +16,60 @@ class GuestLoraModel:
     def __init__(self, lora_state_dict, lora_config_dict):
         self.lora_config = LoraConfig(**lora_config_dict)
         self._modules = nn.ModuleDict()  # 使用ModuleDict来妥善管理所有层
+        # 原始模块名 -> 安全化键（用于 ModuleDict，不含 '.'）
+        self._name_map = {}
         self._scaling = self.lora_config.lora_alpha / self.lora_config.r
 
         # 1. 识别所有独立的LoRA模块
-        # 我们通过查找 lora_A.weight 的键来确定有哪些模块被适配了
-        lora_a_keys = [k for k in lora_state_dict if k.endswith("lora_A.weight")]
+        # 我们支持两种键格式：
+        # 1) module...lora_A.weight (无adapter名)
+        # 2) module...lora_A.<adapter>.weight  (带adapter名，比如default)
+        lora_a_keys = [k for k in lora_state_dict if (".lora_A." in k and k.endswith(".weight")) or k.endswith("lora_A.weight")]
 
         for a_key in lora_a_keys:
-            # 模块名是 'lora_A.weight' 之前的部分
-            # e.g., "base_model.model.layers.0.self_attn.q_proj"
-            module_name = a_key.removesuffix(".lora_A.weight")
-            b_key = f"{module_name}.lora_B.weight"
+            # 解析两种可能的格式
+            if ".lora_A." in a_key and a_key.endswith(".weight"):
+                # 带 adapter 名的：module... .lora_A.<adapter>.weight
+                module_name, tail = a_key.split(".lora_A.", 1)
+                adapter = tail[:-len(".weight")]  # e.g. "default"
+                b_key = f"{module_name}.lora_B.{adapter}.weight"
+            else:
+                # 旧格式或无 adapter：module...lora_A.weight
+                module_name = a_key.removesuffix(".lora_A.weight")
+                b_key = f"{module_name}.lora_B.weight"
+
+            if b_key not in lora_state_dict:
+                print(f"  - Warning: Corresponding LoRA B key not found for '{a_key}', expected '{b_key}'. Skipping.")
+                continue
 
             # 2. 从权重张量的形状推断出维度
             lora_a_weight = lora_state_dict[a_key]
             lora_b_weight = lora_state_dict[b_key]
-            
+            if not isinstance(lora_a_weight, torch.Tensor):
+                lora_a_weight = torch.tensor(lora_a_weight)
+            if not isinstance(lora_b_weight, torch.Tensor):
+                lora_b_weight = torch.tensor(lora_b_weight)
+
             # W_A shape: (rank, in_features)
             # W_B shape: (out_features, rank)
             rank, in_features = lora_a_weight.shape
             out_features, _ = lora_b_weight.shape
 
-            # 3. 创建LoRA A和B线性层
+            # 3. 创建LoRA A和B线性层（保持与权重形状一致）
             lora_a_layer = nn.Linear(in_features, rank, bias=False)
             lora_b_layer = nn.Linear(rank, out_features, bias=False)
 
-            # 4. 加载对应的权重
-            lora_a_layer.load_state_dict({'weight': lora_a_weight})
-            lora_b_layer.load_state_dict({'weight': lora_b_weight})
+            # 4. 直接拷贝权重到层中
+            with torch.no_grad():
+                lora_a_layer.weight.data.copy_(lora_a_weight)
+                lora_b_layer.weight.data.copy_(lora_b_weight)
 
-            # 5. 将构建好的层存入ModuleDict，使用模块名作为键
-            self._modules[module_name] = nn.Sequential(lora_a_layer, lora_b_layer)
-            print(f"  - Built LoRA module for: {module_name} (in: {in_features}, r: {rank}, out: {out_features})")
-
+            # 5. 将构建好的层存入ModuleDict，ModuleDict不允许键含'.'，将所有'.'替换为'-'
+            safe_key = module_name.replace('.', '-')
+            self._modules[safe_key] = nn.Sequential(lora_a_layer, lora_b_layer)
+            self._name_map[module_name] = safe_key
+            # print(f"  - Built LoRA module for: {module_name} -> safe_key: {safe_key} (adapter: {'<none>' if '.' not in a_key else adapter}, in: {in_features}, r: {rank}, out: {out_features})")
+ 
         self._modules.eval() # 设置为评估模式
         print("RemoteLoraGuest initialized successfully.")
 
@@ -64,11 +85,16 @@ class GuestLoraModel:
         Returns:
             torch.Tensor: 计算出的增量 delta_h。
         """
-        if module_name not in self._modules:
-            raise ValueError(f"Unknown LoRA module name: {module_name}")
+        safe_key = self._name_map.get(module_name)
+        if safe_key is None:
+            # 兼容：如果 host 传入的就是安全键（罕见场景），直接使用
+            if module_name in self._modules:
+                safe_key = module_name
+            else:
+                raise ValueError(f"Unknown LoRA module name: {module_name}")
 
         # 确保输入张量的数据类型与模型权重一致
-        lora_layers = self._modules[module_name]
+        lora_layers = self._modules[safe_key]
         dtype = lora_layers[0].weight.dtype
         x = x.to(dtype)
 
@@ -105,36 +131,50 @@ class SliceLinear(LoraLinear):
         self.shm = shm
 
     def forward(self, x: torch.Tensor):
-        # 1. 在Host本地计算基础模型的输出
-        if self.disable_adapters or self.active_adapter not in self.lora_A:
+        print("1. 在Host本地计算基础模型的输出")
+        host_start = time.time()
+        active_adapters = self.active_adapter if isinstance(self.active_adapter, (list, tuple)) else [self.active_adapter]
+
+        # 如果禁用 adapter，或所有激活 adapter 都不在本层 lora_A 中，就跳过 LoRA 部分
+        if self.disable_adapters or all(a not in self.lora_A for a in active_adapters):
+            print("非LoRA层，直接本地计算")
             return self.base_layer(x)
 
         result = self.base_layer(x)
+        host_end = time.time()
 
-        # 2. 将LoRA部分的计算外包给Guest
+        print("2. 将LoRA部分的计算外包给Guest")
         tensor_bytes = ic.tensor2bytes(x)
         msg_id = int(time.time()) 
-        request_blocks = ic.tensor_bytes_and_module_name2blocks(tensor_bytes, msg_id=msg_id, module_name=self.module_name)
+        request_blocks = ic.tensor_bytes_and_module_name2blocks(tensor_bytes, msg_id=0, module_name=self.module_name)
         
-        # 3. 发送请求到共享内存
+        print("3. 发送请求到共享内存")
+        # print(f"请求包含 {len(request_blocks)} 个块")
+        host_write_start = time.time()
         ic.write_blocks(self.shm, request_blocks, "host")
+        host_write_end = time.time()
 
-        # 4. 等待并接收Guest的响应
+        print("4. 等待并接收Guest的响应")
         response_blocks = []
+        host_read_start, host_read_end = 0, 0
         while True:
+            host_read_start = time.time()
             response_blocks = ic.read_blocks(self.shm, "host")
             if len(response_blocks) > 0:
+                host_read_end = time.time()
                 break
             time.sleep(0.001)
-
-        # 5. 解析响应
+        # print(f"响应包含 {len(response_blocks)} 个块")
+        print("5. 解析响应")
         delta_h_bytes, _ = ic.blocks2tensor_bytes_and_module_name(response_blocks)
         delta_h = ic.bytes2tensor(delta_h_bytes, use_gpu=torch.cuda.is_available())
         
-        # 6. 合并结果
+        print("6. 合并结果")
         delta_h = delta_h.to(result.device, dtype=result.dtype)
         result += delta_h
-        
+        guest_end = time.time()
+        with open("log_host.txt", "a") as log_f:
+            log_f.write(f"{guest_end - host_end:.6f} {host_write_end - host_write_start:.6f} {host_read_end - host_read_start:.6f}\n")
         return result
 
 def replace_lora_layers(model: nn.Module, shm):
@@ -154,6 +194,7 @@ def replace_lora_layers(model: nn.Module, shm):
 
 
 def guest_main():
+    open("log_guest.txt", "w").close()
     with open(GUEST_SHM_PATH, "r+b") as f:
         shm = mmap.mmap(f.fileno(), 16 * 1024 * 1024)
         while True:
@@ -164,7 +205,7 @@ def guest_main():
                 lora_config_blocks = blocks[split_point:]
                 break
             else:
-                time.sleep(0.01)
+                time.sleep(0.001)
 
         serialized_weights = ic.blocks2bytes(lora_weight_blocks)
         serialized_config = ic.blocks2bytes(lora_config_blocks)
@@ -177,26 +218,33 @@ def guest_main():
         print("[GUEST] LoRA layers initialized. Waiting for requests...")
         
         while True:
+            guest_read_start = time.time()
             request_blocks = ic.read_blocks(shm, "guest")
             if len(request_blocks) > 0:
+                guest_read_end = time.time()
                 tensor_bytes, module_name = ic.blocks2tensor_bytes_and_module_name(request_blocks)
                 input_tensor = ic.bytes2tensor(tensor_bytes, use_gpu=False)
                 print(f"[GUEST] Received request for module: {module_name}")
 
                 # 执行LoRA前向传播计算
+                guest_forward_start = time.time()
                 delta_h = guest_lora_model.forward(module_name, input_tensor)
-
+                guest_forward_end = time.time()
                 # 准备并发送响应
                 response_bytes = ic.tensor2bytes(delta_h)
                 msg_id = int(time.time())
-                response_blocks = ic.tensor_bytes_and_module_name2blocks(response_bytes, msg_id=msg_id)
+                response_blocks = ic.tensor_bytes_and_module_name2blocks(response_bytes, msg_id=0)
+                guest_write_start = time.time()
                 ic.write_blocks(shm, response_blocks, "guest")
+                guest_write_end = time.time()
                 print(f"[GUEST] Sent response for module: {module_name}")
+                with open("log_guest.txt", "a") as log_f:
+                    log_f.write(f"{guest_forward_end - guest_forward_start:.6f} {guest_write_end - guest_write_start:.6f} {guest_read_end - guest_read_start:.6f}\n")
             else:
-                # 如果没有读到数据，短暂休眠避免CPU空转
                 time.sleep(0.001)
 
 def host_main():
+    open("log_host.txt", "w").close()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_DIR)
     if tokenizer.pad_token is None:
@@ -218,8 +266,6 @@ def host_main():
         shm = mmap.mmap(f.fileno(), 16 * 1024 * 1024)
         model = replace_lora_layers(model, shm)
         lora_weights_bytes, lora_config_bytes = ic.lora_weight_config2bytes(model)
-        # 设计的时候没有考虑两次连续传输的同步问题，而这种情况仅限于一开始的lora权重和配置初始化，所以
-        # 这里暂且将两组数据块合并，每个数据块组的msg_id是改组块的数量，方便解包
         lora_weights_block_num = (len(lora_weights_bytes) + ic.PAYLOAD_SIZE - 1) // ic.PAYLOAD_SIZE
         lora_weight_blocks = ic.bytes2blocks(lora_weights_bytes, msg_id=lora_weights_block_num, force_is_not_last=True)
         lora_config_blocks = ic.bytes2blocks(lora_config_bytes, msg_id=lora_weights_block_num)
@@ -240,7 +286,8 @@ def host_main():
             time.sleep(0.01)
             
     print("[HOST] 推理开始")
-    prompt = "How many states does the US have?"
+    # prompt = "How many states does the US have?"
+    prompt = "Say \"Hello\", do not include other words."
     inputs = tokenizer(
         prompt,
         return_tensors="pt",
