@@ -195,7 +195,7 @@ def write_blocks(shm, blocks, role):
             copy_time += (copy_end - copy_start)
             offset += BLOCK_SIZE
             block_count += 1
-        print(f"{role} 写，获取锁 {acquire_lock_end - acquire_lock_begin:.6f} s，复制内存 {copy_time:.6f} s，清空内存 {clear_shm_end - clear_shm_start:.6f} s")
+        # print(f"{role} 写，获取锁 {acquire_lock_end - acquire_lock_begin:.6f} s，复制内存 {copy_time:.6f} s，清空内存 {clear_shm_end - clear_shm_start:.6f} s")
     finally:
         release_lock(shm)
 
@@ -245,7 +245,8 @@ def read_blocks(shm, role):
                     acquire_lock(shm)
                     offset = HOST_GUEST_OFFSET + 1
         if have_blocks:
-            print(f"{role} 读，获取锁 {acquire_lock_end - acquire_lock_begin:.6f} s，复制内存 {copy_time:.6f} s")
+            # print(f"{role} 读，获取锁 {acquire_lock_end - acquire_lock_begin:.6f} s，复制内存 {copy_time:.6f} s")
+            pass
         return blocks
     finally:
         if should_clear:

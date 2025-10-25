@@ -174,7 +174,7 @@ class SliceLinear(LoraLinear):
         result += delta_h
         guest_end = time.time()
         with open("log_host.txt", "a") as log_f:
-            log_f.write(f"{guest_end - host_end:.6f} {host_write_end - host_write_start:.6f} {host_read_end - host_read_start:.6f}\n")
+            log_f.write(f"{(host_write_end - host_write_start + host_read_end - host_read_start):.6f}\n")
         return result
 
 def replace_lora_layers(model: nn.Module, shm):
@@ -239,7 +239,7 @@ def guest_main():
                 guest_write_end = time.time()
                 # print(f"[GUEST] Sent response for module: {module_name}")
                 with open("log_guest.txt", "a") as log_f:
-                    log_f.write(f"{guest_forward_end - guest_forward_start:.6f} {guest_write_end - guest_write_start:.6f} {guest_read_end - guest_read_start:.6f}\n")
+                    log_f.write(f"{(guest_write_end - guest_write_start + guest_read_end - guest_read_start):6f}\n")
             else:
                 time.sleep(0.001)
 
@@ -262,6 +262,9 @@ def host_main():
     )
     model.eval()
     
+    total_time = 0.0 # host
+    init_time = 0.0 # host
+    init_start = time.time()
     with open(HOST_SHM_PATH, "r+b") as f:
         shm = mmap.mmap(f.fileno(), 16 * 1024 * 1024)
         model = replace_lora_layers(model, shm)
@@ -285,9 +288,11 @@ def host_main():
         else:
             time.sleep(0.01)
             
+    init_end = time.time()
+    init_time = init_end - init_start
     print("[HOST] 推理开始")
-    # prompt = "How many states does the US have?"
-    prompt = "Say \"Hello\", do not include other words."
+    prompt = "How many states does the US have?"
+    # prompt = "Say \"Hello\", do not include other words."
     inputs = tokenizer(
         prompt,
         return_tensors="pt",
@@ -299,16 +304,66 @@ def host_main():
         output_ids = model.generate(
             **inputs,
             max_new_tokens=256,
-            do_sample=True,             # 启用采样以获得更自然的结果
-            temperature=0.7,            # 采样温度
-            top_p=0.9,                  # Top-p 采样
-            repetition_penalty=1.1,     # 惩罚重复
+            do_sample=False,  # 禁用采样 -> 更确定性
             eos_token_id=tokenizer.eos_token_id,
         )
 
     output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
     print(output_text)
+    total_end = time.time()
+    total_time = total_end - init_start
+    print(f"[HOST] 初始化时间: {init_time:.6f} 秒")
+    print(f"[HOST] 总时间: {total_time:.6f} 秒")
 
+def test_host(with_lora=False):
+    # 在host上纯用GPU/CPU推理，with_lora=True时加载并使用LoRA权重
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_DIR)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
+    if with_lora:
+        # 先加载基础模型，再用PEFT加载LoRA权重
+        base_model = AutoModelForCausalLM.from_pretrained(
+            BASE_MODEL_DIR,
+            dtype=dtype,
+            device_map="auto",
+        )
+        model = PeftModel.from_pretrained(base_model, LORA_MODEL_DIR)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            BASE_MODEL_DIR,
+            dtype=dtype,
+            device_map="auto",
+        )
+
+    model.eval()
+    prompt = "How many states does the US have?"
+    # prompt = "Say \"Hello\", do not include other words."
+    host_start = time.time()
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        padding=True,
+        truncation=True
+    ).to(device)
+
+    with torch.no_grad():
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=256,
+            do_sample=False,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+
+    output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    host_end = time.time()
+    print(output_text)
+    print(f"[HOST-ONLY{'-LoRA' if with_lora else ''}] 总时间: {host_end - host_start:.6f} 秒")
+    
+    
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Client for Model Inference")
@@ -317,5 +372,6 @@ if __name__ == "__main__":
     client_role = args.role
     if client_role == "host":
         host_main()
+        # test_host(False)
     else:
         guest_main()
