@@ -138,10 +138,11 @@ class SliceLinear(LoraLinear):
         # 如果禁用 adapter，或所有激活 adapter 都不在本层 lora_A 中，就跳过 LoRA 部分
         if self.disable_adapters or all(a not in self.lora_A for a in active_adapters):
             print("非LoRA层，直接本地计算")
+            base_end = time.time()
             return self.base_layer(x)
 
         result = self.base_layer(x)
-        host_end = time.time()
+        base_end = time.time()
 
         # print("2. 将LoRA部分的计算外包给Guest")
         tensor_bytes = ic.tensor2bytes(x)
@@ -172,9 +173,12 @@ class SliceLinear(LoraLinear):
         # print("6. 合并结果")
         delta_h = delta_h.to(result.device, dtype=result.dtype)
         result += delta_h
-        guest_end = time.time()
+        host_end = time.time()
         with open("log_host.txt", "a") as log_f:
-            log_f.write(f"{(host_write_end - host_write_start + host_read_end - host_read_start):.6f}\n")
+            # host传输时间
+            # host的forward函数中，除了传输和等待guest的时间
+            # host等待guest的时间
+            log_f.write(f"{(host_write_end - host_write_start + host_read_end - host_read_start):.6f} {(host_end - host_read_end + host_write_start - host_start):6f} {(host_read_start - host_write_end):6f}\n")
         return result
 
 def replace_lora_layers(model: nn.Module, shm):
@@ -187,7 +191,7 @@ def replace_lora_layers(model: nn.Module, shm):
             new_module = SliceLinear(module, name, shm)
             setattr(parent_module, child_name, new_module)
             replaced_count += 1
-            print(f"  - Replaced '{name}' with SliceLinear.")
+            # print(f"  - Replaced '{name}' with SliceLinear.")
     
     print(f"Replacement complete. Total layers replaced: {replaced_count}")
     return model
@@ -195,6 +199,10 @@ def replace_lora_layers(model: nn.Module, shm):
 
 def guest_main():
     open("log_guest.txt", "w").close()
+    open("log_tensor2bytes.txt", "w").close()
+    open("log_tensor_bytes_and_module_name2blocks.txt", "w").close()
+    open("log_blocks2tensor_bytes_and_module_name.txt", "w").close()
+    open("log_bytes2tensor.txt", "w").close()
     with open(GUEST_SHM_PATH, "r+b") as f:
         shm = mmap.mmap(f.fileno(), 16 * 1024 * 1024)
         while True:
@@ -213,10 +221,13 @@ def guest_main():
         print(f"LoRA config size: {len(serialized_config) / 1024:.2f} KB")
         lora_state_dict, lora_config_dict = ic.bytes2lora_weight_config(serialized_weights, serialized_config)
         guest_lora_model = GuestLoraModel(lora_state_dict, lora_config_dict)
+        device = torch.device("cpu")
+        guest_lora_model._modules.to(device)
         ic.clear_shm(shm)
         ic.write_ret_uint8(shm, 1) # 告诉host，guest端准备好了
         print("[GUEST] LoRA layers initialized. Waiting for requests...")
         
+        guest_poll_time = 0.0
         while True:
             guest_read_start = time.time()
             request_blocks = ic.read_blocks(shm, "guest")
@@ -239,13 +250,20 @@ def guest_main():
                 guest_write_end = time.time()
                 # print(f"[GUEST] Sent response for module: {module_name}")
                 with open("log_guest.txt", "a") as log_f:
-                    log_f.write(f"{(guest_write_end - guest_write_start + guest_read_end - guest_read_start):6f}\n")
+                    log_f.write(f"{(guest_write_end - guest_write_start + guest_read_end - guest_read_start):6f} {(guest_forward_end - guest_forward_start):6f} {(guest_write_start - guest_read_end):6f}\n")
             else:
                 time.sleep(0.001)
+                # guest_poll_time += time.time() - guest_read_start
+                # print(f"[GUEST] Total polling time: {guest_poll_time:.6f} seconds")
 
 def host_main():
     open("log_host.txt", "w").close()
+    open("log_tensor2bytes.txt", "w").close()
+    open("log_tensor_bytes_and_module_name2blocks.txt", "w").close()
+    open("log_blocks2tensor_bytes_and_module_name.txt", "w").close()
+    open("log_bytes2tensor.txt", "w").close()
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Host using device: {device}")
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_DIR)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -267,19 +285,20 @@ def host_main():
     init_start = time.time()
     with open(HOST_SHM_PATH, "r+b") as f:
         shm = mmap.mmap(f.fileno(), 16 * 1024 * 1024)
-        model = replace_lora_layers(model, shm)
+        # 1) 先在模型还保留 LoraLinear 时序列化 LoRA 权重和配置并写入共享内存
         lora_weights_bytes, lora_config_bytes = ic.lora_weight_config2bytes(model)
         lora_weights_block_num = (len(lora_weights_bytes) + ic.PAYLOAD_SIZE - 1) // ic.PAYLOAD_SIZE
         lora_weight_blocks = ic.bytes2blocks(lora_weights_bytes, msg_id=lora_weights_block_num, force_is_not_last=True)
         lora_config_blocks = ic.bytes2blocks(lora_config_bytes, msg_id=lora_weights_block_num)
         print(f"msg_id是{lora_weights_block_num}")
         print(f"两段blocks的长度分别是{len(lora_weight_blocks)}和{len(lora_config_blocks)}")
-        # 拼接两组块，发送lora权重和配置
         packed_blocks = lora_weight_blocks + lora_config_blocks
         ic.clear_shm(shm)
         ic.write_ret_uint8(shm, 0)
         ic.write_blocks(shm, packed_blocks, "host")
-        
+
+        # 2) 在把权重发送完毕并通知 guest 后，再把本地的 LoraLinear 替换为委托层
+        model = replace_lora_layers(model, shm)
     
     # 读到guest端准备好的信号后，开始推理
     while True:
@@ -300,6 +319,7 @@ def host_main():
         truncation=True
     ).to(device)
     
+    gen_start = time.time()
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
@@ -307,49 +327,71 @@ def host_main():
             do_sample=False,  # 禁用采样 -> 更确定性
             eos_token_id=tokenizer.eos_token_id,
         )
+    gen_end = time.time()
 
     output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
     print(output_text)
     total_end = time.time()
     total_time = total_end - init_start
     print(f"[HOST] 初始化时间: {init_time:.6f} 秒")
+    print(f"[HOST] 生成时间: {gen_end - gen_start:.6f} 秒")
     print(f"[HOST] 总时间: {total_time:.6f} 秒")
 
 def test_host(with_lora=False):
-    # 在host上纯用GPU/CPU推理，with_lora=True时加载并使用LoRA权重
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_DIR)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    dtype = torch.bfloat16
 
+    # 先在默认位置加载 base_model（不使用 device_map="auto"），然后显式移动到目标 device
+    base_model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL_DIR,
+        torch_dtype=dtype,
+        device_map=None,
+    )
     if with_lora:
-        # 先加载基础模型，再用PEFT加载LoRA权重
-        base_model = AutoModelForCausalLM.from_pretrained(
-            BASE_MODEL_DIR,
-            dtype=dtype,
-            device_map="auto",
-        )
-        model = PeftModel.from_pretrained(base_model, LORA_MODEL_DIR)
+        model = PeftModel.from_pretrained(base_model, LORA_MODEL_DIR, device_map=None)
     else:
-        model = AutoModelForCausalLM.from_pretrained(
-            BASE_MODEL_DIR,
-            dtype=dtype,
-            device_map="auto",
-        )
+        model = base_model
 
+    # 显式把整个 model 移到目标 device，并设置 dtype（多数情况下 transformers 会接受 torch_dtype，但再次确保）
+    model.to(device=device, dtype=dtype)
     model.eval()
+
+    # 诊断：PeftModel 与 LoRA 层计数，以及参数设备分布
+    is_peft = isinstance(model, PeftModel)
+    print(f"is PeftModel: {is_peft}")
+    try:
+        from peft.tuners.lora.layer import Linear as LoraLinear
+    except Exception:
+        LoraLinear = None
+    lora_count = sum(1 for _, m in model.named_modules() if LoraLinear is not None and isinstance(m, LoraLinear))
+    print(f"LoRA Linear layer count: {lora_count}")
+
+    device_counts = {}
+    for name, p in model.named_parameters():
+        d = str(p.device)
+        device_counts[d] = device_counts.get(d, 0) + 1
+    print("Parameter device distribution (device: param_count):", device_counts)
+
+    # 计时与推理
     prompt = "How many states does the US have?"
-    # prompt = "Say \"Hello\", do not include other words."
-    host_start = time.time()
+    tok_start = time.time()
     inputs = tokenizer(
         prompt,
         return_tensors="pt",
         padding=True,
         truncation=True
-    ).to(device)
+    )
+    # 将输入张量移动到 device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    tok_end = time.time()
+    print(f"Tokenization + .to(device) time: {tok_end - tok_start:.6f} 秒")
 
+    gen_start = time.time()
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
@@ -357,12 +399,80 @@ def test_host(with_lora=False):
             do_sample=False,
             eos_token_id=tokenizer.eos_token_id,
         )
+    gen_end = time.time()
 
     output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-    host_end = time.time()
     print(output_text)
-    print(f"[HOST-ONLY{'-LoRA' if with_lora else ''}] 总时间: {host_end - host_start:.6f} 秒")
-    
+    print(f"[HOST-ONLY{'-LoRA' if with_lora else ''}] Generation time (only): {gen_end - gen_start:.6f} 秒")
+    print(f"[HOST-ONLY{'-LoRA' if with_lora else ''}] Total (tok + gen): {(tok_end - tok_start) + (gen_end - gen_start):.6f} 秒")
+ 
+ 
+ 
+# 每次发送一个小包，正常流程中的操作都不做，改为等待1秒，
+test_bytes = b"test"*60000
+test_block = ic.tensor_bytes_and_module_name2blocks(test_bytes, msg_id=0, module_name="test_module")
+
+def test_poll_host():
+    open("log_tensor2bytes.txt", "w").close()
+    open("log_tensor_bytes_and_module_name2blocks.txt", "w").close()
+    open("log_blocks2tensor_bytes_and_module_name.txt", "w").close()
+    open("log_bytes2tensor.txt", "w").close()
+    host_transfer_time = 0.0
+    host_wait_guest_time = 0.0
+    host_exec_time = 0.0
+    with open(HOST_SHM_PATH, "r+b") as f:
+        shm = mmap.mmap(f.fileno(), 16 * 1024 * 1024)
+        host_start = time.time()
+        for _ in range(600):
+            host_exec_start = time.time()
+            for _ in range(300):
+                ic.tensor_bytes_and_module_name2blocks(test_bytes, msg_id=0, module_name="test_module")
+            host_write_start = time.time()
+            host_exec_time += host_write_start - host_exec_start
+            ic.write_blocks(shm, test_block, "host")
+            host_write_end = time.time()
+            while True:
+                host_read_start = time.time()
+                response_blocks = ic.read_blocks(shm, "host")
+                if len(response_blocks) > 0:
+                    host_read_end = time.time()
+                    host_wait_guest_time += host_read_start - host_write_end # 包含了guest读写的时间
+                    host_transfer_time += host_write_end - host_write_start + host_read_end - host_read_start
+                    break
+                else:
+                    time.sleep(0.001)
+        host_end = time.time()
+        print(f"host总时间{host_end - host_start:.6f}秒")
+        print(f"host传输时间{host_transfer_time:.6f}秒")
+        print(f"host执行时间{host_exec_time:.6f}秒")
+        print(f"host等待guest时间{host_wait_guest_time:.6f}秒")
+
+
+def test_poll_guest():
+    open("log_tensor2bytes.txt", "w").close()
+    open("log_tensor_bytes_and_module_name2blocks.txt", "w").close()
+    open("log_blocks2tensor_bytes_and_module_name.txt", "w").close()
+    open("log_bytes2tensor.txt", "w").close()
+    guest_transfer_time = 0.0
+    guest_exec_time = 0.0
+    with open(GUEST_SHM_PATH, "r+b") as f:
+        shm = mmap.mmap(f.fileno(), 16 * 1024 * 1024)
+        while True:
+            guest_read_start = time.time()
+            request_blocks = ic.read_blocks(shm, "guest")
+            if len(request_blocks) > 0:
+                guest_read_end = time.time()
+                for _ in range(300):
+                    ic.tensor_bytes_and_module_name2blocks(test_bytes, msg_id=0, module_name="test_module")
+                guest_write_start = time.time()
+                guest_exec_time += guest_write_start - guest_read_end
+                ic.write_blocks(shm, test_block, "guest")
+                guest_write_end = time.time()
+                guest_transfer_time += guest_write_end - guest_write_start + guest_read_end - guest_read_start
+                print(f"guest传输时间{guest_transfer_time:.6f}秒")
+                print(f"guest执行时间{guest_exec_time:.6f}秒")
+            else:
+                time.sleep(0.001)
     
 
 if __name__ == "__main__":
@@ -371,7 +481,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
     client_role = args.role
     if client_role == "host":
-        host_main()
-        # test_host(False)
+        # host_main()
+        # test_host(True)
+        test_poll_host()
     else:
-        guest_main()
+        # guest_main()
+        test_poll_guest()

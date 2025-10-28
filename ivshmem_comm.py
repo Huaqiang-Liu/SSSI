@@ -64,6 +64,7 @@ def clear_shm(shm): # 清空共享内存
 
 # 一层的输出->字节
 def tensor2bytes(tensor: torch.Tensor) -> bytes:
+    func_start = time.time()
     t = tensor.detach()
     orig_dtype = str(t.dtype)  # record original torch dtype as string
 
@@ -86,12 +87,16 @@ def tensor2bytes(tensor: torch.Tensor) -> bytes:
     }
     meta_bytes = json.dumps(meta).encode('utf-8')
     meta_len = len(meta_bytes).to_bytes(4, 'little')  # prepend 4-byte length
+    func_end = time.time()
+    with open("log_tensor2bytes.txt", "a") as log_f:
+        log_f.write(f"{(func_end - func_start):.6f}\n")
     return meta_len + meta_bytes + np_array.tobytes()
 
 
 
 # 产生header+字节+可选模块名称（host发送给guest时需要指定推理哪的lora层，反之只用发tensor）->blocks
 def tensor_bytes_and_module_name2blocks(tensor_bytes: bytes, msg_id: int, module_name: str = '') -> list:
+    func_start = time.time()
     blocks = []
     total_data = {
         'tensor': tensor_bytes,
@@ -113,11 +118,14 @@ def tensor_bytes_and_module_name2blocks(tensor_bytes: bytes, msg_id: int, module
         header = struct.pack(BLOCK_HEADER_FORMAT, msg_id, seq_id, is_last, payload_len)
         assert len(header) == HEADER_SIZE, 'Header must be exactly 9 bytes'
         blocks.append(header + payload)
-
+    func_end = time.time()
+    with open("log_tensor_bytes_and_module_name2blocks.txt", "a") as log_f:
+        log_f.write(f"{(func_end - func_start):.6f}\n")
     return blocks
 
 # blocks->tensor的字节序列和module_name
 def blocks2tensor_bytes_and_module_name(blocks: list) -> tuple:
+    func_start = time.time()
     # 按seq_id排序
     blocks.sort(key=lambda b: struct.unpack('<H', b[4:6])[0])
     payloads = [b[HEADER_SIZE:HEADER_SIZE + struct.unpack('<H', b[7:9])[0]] for b in blocks]
@@ -126,10 +134,14 @@ def blocks2tensor_bytes_and_module_name(blocks: list) -> tuple:
     total_data = torch.load(buffer, map_location='cpu')
     tensor_bytes = total_data.get('tensor', b'')
     module_name = total_data.get('module_name', '')
+    func_end = time.time()
+    with open("log_blocks2tensor_bytes_and_module_name.txt", "a") as log_f:
+        log_f.write(f"{(func_end - func_start):.6f}\n")
     return tensor_bytes, module_name
 
 # tensor的字节序列->给下一层的tensor
 def bytes2tensor(data: bytes, use_gpu: bool = False) -> torch.Tensor:
+    func_start = time.time()
     meta_len = int.from_bytes(data[:4], 'little')
     meta = json.loads(data[4:4+meta_len].decode('utf-8'))
     tensor_data = data[4+meta_len:]
@@ -141,6 +153,9 @@ def bytes2tensor(data: bytes, use_gpu: bool = False) -> torch.Tensor:
     t = torch.from_numpy(np_array.copy())
 
     orig_torch_dtype = meta.get('orig_torch_dtype', None)
+    func_end = time.time()
+    with open("log_bytes2tensor.txt", "a") as log_f:
+        log_f.write(f"{(func_end - func_start):.6f}\n")
     # If original was bfloat16 and user wants GPU and CUDA available, cast back on GPU
     if use_gpu and orig_torch_dtype == 'torch.bfloat16' and torch.cuda.is_available():
         return t.cuda().to(torch.bfloat16)
@@ -183,8 +198,6 @@ def write_blocks(shm, blocks, role):
         copy_time = 0.0 # 记录复制内存的时间
         for block in blocks:
             if block_count > 0 and block_count % MAX_BLOCK_NUM == 0:
-                # 先清空共享内存
-                clear_shm(shm)
                 release_lock(shm)
                 time.sleep(1)
                 acquire_lock(shm)
@@ -195,7 +208,7 @@ def write_blocks(shm, blocks, role):
             copy_time += (copy_end - copy_start)
             offset += BLOCK_SIZE
             block_count += 1
-        # print(f"{role} 写，获取锁 {acquire_lock_end - acquire_lock_begin:.6f} s，复制内存 {copy_time:.6f} s，清空内存 {clear_shm_end - clear_shm_start:.6f} s")
+        # print(f"{role} 写，写入block数量{len(blocks)}")
     finally:
         release_lock(shm)
 
@@ -241,11 +254,11 @@ def read_blocks(shm, role):
                 if len(blocks) > 0 and len(blocks) % MAX_BLOCK_NUM == 0:
                     clear_shm(shm)
                     release_lock(shm)
-                    time.sleep(1)
+                    time.sleep(2)
                     acquire_lock(shm)
                     offset = HOST_GUEST_OFFSET + 1
         if have_blocks:
-            # print(f"{role} 读，获取锁 {acquire_lock_end - acquire_lock_begin:.6f} s，复制内存 {copy_time:.6f} s")
+            # print(f"{role} 读，读取block数量{len(blocks)}")
             pass
         return blocks
     finally:
