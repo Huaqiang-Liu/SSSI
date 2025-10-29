@@ -11,6 +11,8 @@ LORA_MODEL_DIR = "./model/llama-3-1b-lora"
 HOST_SHM_PATH = "/dev/shm/shm1"
 GUEST_SHM_PATH = "/sys/bus/pci/devices/0000:00:02.0/resource2"
 
+RR = 0.0005 # 轮询等待时间
+
 # 根据host构建好模型后发来的lora相关权重和配置，初始化guest端的lora层
 class GuestLoraModel:
     def __init__(self, lora_state_dict, lora_config_dict):
@@ -131,31 +133,26 @@ class SliceLinear(LoraLinear):
         self.shm = shm
 
     def forward(self, x: torch.Tensor):
-        # print("1. 在Host本地计算基础模型的输出")
         host_start = time.time()
         active_adapters = self.active_adapter if isinstance(self.active_adapter, (list, tuple)) else [self.active_adapter]
 
         # 如果禁用 adapter，或所有激活 adapter 都不在本层 lora_A 中，就跳过 LoRA 部分
         if self.disable_adapters or all(a not in self.lora_A for a in active_adapters):
             print("非LoRA层，直接本地计算")
-            base_end = time.time()
+            # base_end = time.time()
             return self.base_layer(x)
 
         result = self.base_layer(x)
-        base_end = time.time()
+        # base_end = time.time()
 
-        # print("2. 将LoRA部分的计算外包给Guest")
         tensor_bytes = ic.tensor2bytes(x)
         msg_id = int(time.time()) 
         request_blocks = ic.tensor_bytes_and_module_name2blocks(tensor_bytes, msg_id=0, module_name=self.module_name)
         
-        # print("3. 发送请求到共享内存")
-        # print(f"请求包含 {len(request_blocks)} 个块")
         host_write_start = time.time()
         ic.write_blocks(self.shm, request_blocks, "host")
         host_write_end = time.time()
 
-        # print("4. 等待并接收Guest的响应")
         response_blocks = []
         host_read_start, host_read_end = 0, 0
         while True:
@@ -164,21 +161,18 @@ class SliceLinear(LoraLinear):
             if len(response_blocks) > 0:
                 host_read_end = time.time()
                 break
-            time.sleep(0.001)
-        # print(f"响应包含 {len(response_blocks)} 个块")
-        # print("5. 解析响应")
+            time.sleep(RR)
         delta_h_bytes, _ = ic.blocks2tensor_bytes_and_module_name(response_blocks)
         delta_h = ic.bytes2tensor(delta_h_bytes, use_gpu=torch.cuda.is_available())
         
-        # print("6. 合并结果")
         delta_h = delta_h.to(result.device, dtype=result.dtype)
         result += delta_h
         host_end = time.time()
         with open("log_host.txt", "a") as log_f:
-            # host传输时间
-            # host的forward函数中，除了传输和等待guest的时间
-            # host等待guest的时间
-            log_f.write(f"{(host_write_end - host_write_start + host_read_end - host_read_start):.6f} {(host_end - host_read_end + host_write_start - host_start):6f} {(host_read_start - host_write_end):6f}\n")
+            # host传输时间 host的forward函数中，除了传输和等待guest的时间 host等待guest的时间
+            log_f.write(f"{(host_write_end - host_write_start + host_read_end - host_read_start):.6f} {(host_end - host_read_end + host_write_start - host_start):6f} {(host_read_start - host_write_end):6f} {host_write_end} {host_read_start}\n")
+            # log_f.write(f"{host_write_end} {host_read_start}\n")
+        
         return result
 
 def replace_lora_layers(model: nn.Module, shm):
@@ -213,7 +207,7 @@ def guest_main():
                 lora_config_blocks = blocks[split_point:]
                 break
             else:
-                time.sleep(0.001)
+                time.sleep(RR)
 
         serialized_weights = ic.blocks2bytes(lora_weight_blocks)
         serialized_config = ic.blocks2bytes(lora_config_blocks)
@@ -235,26 +229,21 @@ def guest_main():
                 guest_read_end = time.time()
                 tensor_bytes, module_name = ic.blocks2tensor_bytes_and_module_name(request_blocks)
                 input_tensor = ic.bytes2tensor(tensor_bytes, use_gpu=False)
-                # print(f"[GUEST] Received request for module: {module_name}")
 
-                # 执行LoRA前向传播计算
                 guest_forward_start = time.time()
                 delta_h = guest_lora_model.forward(module_name, input_tensor)
                 guest_forward_end = time.time()
-                # 准备并发送响应
                 response_bytes = ic.tensor2bytes(delta_h)
                 msg_id = int(time.time())
                 response_blocks = ic.tensor_bytes_and_module_name2blocks(response_bytes, msg_id=0)
                 guest_write_start = time.time()
                 ic.write_blocks(shm, response_blocks, "guest")
                 guest_write_end = time.time()
-                # print(f"[GUEST] Sent response for module: {module_name}")
                 with open("log_guest.txt", "a") as log_f:
-                    log_f.write(f"{(guest_write_end - guest_write_start + guest_read_end - guest_read_start):6f} {(guest_forward_end - guest_forward_start):6f} {(guest_write_start - guest_read_end):6f}\n")
+                    log_f.write(f"{(guest_write_end - guest_write_start + guest_read_end - guest_read_start):6f} {(guest_forward_end - guest_forward_start):6f} {(guest_write_start - guest_read_end):6f} {guest_read_start} {guest_write_end}\n")
+                    # log_f.write(f"{guest_read_start} {guest_write_end}\n")
             else:
-                time.sleep(0.001)
-                # guest_poll_time += time.time() - guest_read_start
-                # print(f"[GUEST] Total polling time: {guest_poll_time:.6f} seconds")
+                time.sleep(RR)
 
 def host_main():
     open("log_host.txt", "w").close()
@@ -338,8 +327,8 @@ def host_main():
     print(f"[HOST] 总时间: {total_time:.6f} 秒")
 
 def test_host(with_lora=False):
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cpu")
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_DIR)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -440,7 +429,7 @@ def test_poll_host():
                     host_transfer_time += host_write_end - host_write_start + host_read_end - host_read_start
                     break
                 else:
-                    time.sleep(0.001)
+                    time.sleep(RR)
         host_end = time.time()
         print(f"host总时间{host_end - host_start:.6f}秒")
         print(f"host传输时间{host_transfer_time:.6f}秒")
@@ -472,7 +461,7 @@ def test_poll_guest():
                 print(f"guest传输时间{guest_transfer_time:.6f}秒")
                 print(f"guest执行时间{guest_exec_time:.6f}秒")
             else:
-                time.sleep(0.001)
+                time.sleep(RR)
     
 
 if __name__ == "__main__":
@@ -481,9 +470,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
     client_role = args.role
     if client_role == "host":
-        # host_main()
+        host_main()
         # test_host(True)
-        test_poll_host()
+        # test_poll_host()
     else:
-        # guest_main()
-        test_poll_guest()
+        guest_main()
+        # test_poll_guest()

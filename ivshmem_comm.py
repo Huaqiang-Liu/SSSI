@@ -64,7 +64,7 @@ def clear_shm(shm): # 清空共享内存
 
 # 一层的输出->字节
 def tensor2bytes(tensor: torch.Tensor) -> bytes:
-    func_start = time.time()
+    # func_start = time.time()
     t = tensor.detach()
     orig_dtype = str(t.dtype)  # record original torch dtype as string
 
@@ -87,24 +87,19 @@ def tensor2bytes(tensor: torch.Tensor) -> bytes:
     }
     meta_bytes = json.dumps(meta).encode('utf-8')
     meta_len = len(meta_bytes).to_bytes(4, 'little')  # prepend 4-byte length
-    func_end = time.time()
-    with open("log_tensor2bytes.txt", "a") as log_f:
-        log_f.write(f"{(func_end - func_start):.6f}\n")
+    # func_end = time.time()
+    # with open("log_tensor2bytes.txt", "a") as log_f:
+    #     log_f.write(f"{(func_end - func_start):.6f}\n")
     return meta_len + meta_bytes + np_array.tobytes()
 
 
 
-# 产生header+字节+可选模块名称（host发送给guest时需要指定推理哪的lora层，反之只用发tensor）->blocks
 def tensor_bytes_and_module_name2blocks(tensor_bytes: bytes, msg_id: int, module_name: str = '') -> list:
-    func_start = time.time()
+    # func_start = time.time()
+    name_bytes = module_name.encode('utf-8')
+    name_len_bytes = struct.pack('<I', len(name_bytes)) # '<I' = 4-byte unsigned int
+    total_data_bytes = name_len_bytes + name_bytes + tensor_bytes
     blocks = []
-    total_data = {
-        'tensor': tensor_bytes,
-        'module_name': module_name
-    }
-    buffer = io.BytesIO()
-    torch.save(total_data, buffer)
-    total_data_bytes = buffer.getvalue()
     total_len = len(total_data_bytes)
     num_blocks = (total_len + PAYLOAD_SIZE - 1) // PAYLOAD_SIZE
 
@@ -118,30 +113,31 @@ def tensor_bytes_and_module_name2blocks(tensor_bytes: bytes, msg_id: int, module
         header = struct.pack(BLOCK_HEADER_FORMAT, msg_id, seq_id, is_last, payload_len)
         assert len(header) == HEADER_SIZE, 'Header must be exactly 9 bytes'
         blocks.append(header + payload)
-    func_end = time.time()
-    with open("log_tensor_bytes_and_module_name2blocks.txt", "a") as log_f:
-        log_f.write(f"{(func_end - func_start):.6f}\n")
+    # func_end = time.time()
+    # with open("log_tensor_bytes_and_module_name2blocks.txt", "a") as log_f:
+    #     log_f.write(f"{(func_end - func_start):.6f}\n")
     return blocks
 
 # blocks->tensor的字节序列和module_name
 def blocks2tensor_bytes_and_module_name(blocks: list) -> tuple:
-    func_start = time.time()
+    # func_start = time.time()
     # 按seq_id排序
     blocks.sort(key=lambda b: struct.unpack('<H', b[4:6])[0])
     payloads = [b[HEADER_SIZE:HEADER_SIZE + struct.unpack('<H', b[7:9])[0]] for b in blocks]
     total_data_bytes = b''.join(payloads)
-    buffer = io.BytesIO(total_data_bytes)
-    total_data = torch.load(buffer, map_location='cpu')
-    tensor_bytes = total_data.get('tensor', b'')
-    module_name = total_data.get('module_name', '')
-    func_end = time.time()
-    with open("log_blocks2tensor_bytes_and_module_name.txt", "a") as log_f:
-        log_f.write(f"{(func_end - func_start):.6f}\n")
+    name_len = struct.unpack('<I', total_data_bytes[:4])[0]
+    name_end = 4 + name_len
+    module_name_bytes = total_data_bytes[4:name_end]
+    module_name = module_name_bytes.decode('utf-8')
+    tensor_bytes = total_data_bytes[name_end:]
+    # func_end = time.time()
+    # with open("log_blocks2tensor_bytes_and_module_name.txt", "a") as log_f:
+    #     log_f.write(f"{(func_end - func_start):.6f}\n")
     return tensor_bytes, module_name
 
 # tensor的字节序列->给下一层的tensor
 def bytes2tensor(data: bytes, use_gpu: bool = False) -> torch.Tensor:
-    func_start = time.time()
+    # func_start = time.time()
     meta_len = int.from_bytes(data[:4], 'little')
     meta = json.loads(data[4:4+meta_len].decode('utf-8'))
     tensor_data = data[4+meta_len:]
@@ -153,9 +149,9 @@ def bytes2tensor(data: bytes, use_gpu: bool = False) -> torch.Tensor:
     t = torch.from_numpy(np_array.copy())
 
     orig_torch_dtype = meta.get('orig_torch_dtype', None)
-    func_end = time.time()
-    with open("log_bytes2tensor.txt", "a") as log_f:
-        log_f.write(f"{(func_end - func_start):.6f}\n")
+    # func_end = time.time()
+    # with open("log_bytes2tensor.txt", "a") as log_f:
+    #     log_f.write(f"{(func_end - func_start):.6f}\n")
     # If original was bfloat16 and user wants GPU and CUDA available, cast back on GPU
     if use_gpu and orig_torch_dtype == 'torch.bfloat16' and torch.cuda.is_available():
         return t.cuda().to(torch.bfloat16)
@@ -177,19 +173,15 @@ def acquire_lock(shm):
         if shm[LOCK_OFFSET] == 0:
             shm[LOCK_OFFSET] = 1
             break
-        time.sleep(0.0001)  # Sleep 1ms to reduce busy-wait
+        time.sleep(0.00001)  # Sleep 0.1ms to reduce busy-wait
 
 def release_lock(shm):
     shm[LOCK_OFFSET] = 0
 
 
 def write_blocks(shm, blocks, role):
-    clear_shm_start = time.time()
     clear_shm(shm)
-    clear_shm_end = time.time()
-    acquire_lock_begin = time.time()
     acquire_lock(shm)
-    acquire_lock_end = time.time()
     try:
         write_host_guest_uint8(shm, 0 if role == "host" else 1)
         
@@ -202,20 +194,14 @@ def write_blocks(shm, blocks, role):
                 time.sleep(1)
                 acquire_lock(shm)
                 offset = HOST_GUEST_OFFSET + 1
-            copy_start = time.time()
             shm[offset:offset+len(block)] = block
-            copy_end = time.time()
-            copy_time += (copy_end - copy_start)
             offset += BLOCK_SIZE
             block_count += 1
-        # print(f"{role} 写，写入block数量{len(blocks)}")
     finally:
         release_lock(shm)
 
 def read_blocks(shm, role):
-    acquire_lock_begin = time.time()
     acquire_lock(shm)
-    acquire_lock_end = time.time()
     should_clear = True # 空的或没有权限读，就不能清空。只有读到了才能清空
     have_blocks = False
     try:
@@ -223,10 +209,7 @@ def read_blocks(shm, role):
         offset = HOST_GUEST_OFFSET + 1
         copy_time = 0.0 # 记录复制内存的时间
         while offset + HEADER_SIZE <= len(shm): # 实际上就是offset <= len(shm)，这么写保险些而已（下一行）
-            copy_start = time.time()
             header = shm[offset:offset+HEADER_SIZE]
-            copy_end = time.time()
-            copy_time += (copy_end - copy_start)
             if all(b == 0 for b in header):
                 should_clear = False
                 break
@@ -240,10 +223,7 @@ def read_blocks(shm, role):
             msg_id, seq_id, is_last, payload_len = struct.unpack(BLOCK_HEADER_FORMAT, header)
             payload_start = offset + HEADER_SIZE
             payload_end = payload_start + payload_len
-            copy_start = time.time()
             payload = shm[payload_start:payload_end]
-            copy_end = time.time()
-            copy_time += (copy_end - copy_start)
             full_block = header + payload
             blocks.append(full_block)
             offset += BLOCK_SIZE
