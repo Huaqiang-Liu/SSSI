@@ -27,7 +27,7 @@ def sum_column_diff(file1_path, file2_path, column_index=0):
 if __name__ == "__main__":
     print(f"总传输时间host{sum_column('log_host.txt', 0)}秒，guest{sum_column('log_guest.txt', 0)}秒")
     print(f"guest上forward函数的执行时间为{sum_column('log_guest.txt', 1)}秒")
-    print(f"guest上读写以外的时间为{sum_column('log_guest.txt', 2)}秒")
+    print(f"guest上传输以外的时间为{sum_column('log_guest.txt', 2)}秒")
     print(f"host上forward函数中，除了传输和等待guest的时间为{sum_column('log_host.txt', 1)}秒")
     print(f"host等待guest的总时间为{sum_column('log_host.txt', 2)}秒")
 

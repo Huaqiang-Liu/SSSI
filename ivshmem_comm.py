@@ -181,27 +181,29 @@ def release_lock(shm):
 
 def write_blocks(shm, blocks, role):
     clear_shm(shm)
-    acquire_lock(shm)
+    # acquire_lock(shm)
     try:
-        write_host_guest_uint8(shm, 0 if role == "host" else 1)
+        # write_host_guest_uint8(shm, 0 if role == "host" else 1)
         
         offset = HOST_GUEST_OFFSET + 1
         block_count = 0
         copy_time = 0.0 # 记录复制内存的时间
         for block in blocks:
             if block_count > 0 and block_count % MAX_BLOCK_NUM == 0:
-                release_lock(shm)
+                # release_lock(shm)
+                write_host_guest_uint8(shm, 0 if role == "host" else 1)
                 time.sleep(1)
-                acquire_lock(shm)
+                # acquire_lock(shm)
                 offset = HOST_GUEST_OFFSET + 1
             shm[offset:offset+len(block)] = block
             offset += BLOCK_SIZE
             block_count += 1
     finally:
-        release_lock(shm)
+        # release_lock(shm)
+        write_host_guest_uint8(shm, 0 if role == "host" else 1)
 
 def read_blocks(shm, role):
-    acquire_lock(shm)
+    # acquire_lock(shm)
     should_clear = True # 空的或没有权限读，就不能清空。只有读到了才能清空
     have_blocks = False
     try:
@@ -209,16 +211,16 @@ def read_blocks(shm, role):
         offset = HOST_GUEST_OFFSET + 1
         copy_time = 0.0 # 记录复制内存的时间
         while offset + HEADER_SIZE <= len(shm): # 实际上就是offset <= len(shm)，这么写保险些而已（下一行）
+            if role == "host" and read_host_guest_uint8(shm) == 0: # host写入的不能host读
+                should_clear = False
+                continue
+            if role == "guest" and read_host_guest_uint8(shm) == 1:
+                should_clear = False
+                continue
             header = shm[offset:offset+HEADER_SIZE]
             if all(b == 0 for b in header):
                 should_clear = False
-                break
-            if role == "host" and read_host_guest_uint8(shm) == 0: # host写入的不能host读
-                should_clear = False
-                break
-            if role == "guest" and read_host_guest_uint8(shm) == 1:
-                should_clear = False
-                break
+                continue
             have_blocks = True
             msg_id, seq_id, is_last, payload_len = struct.unpack(BLOCK_HEADER_FORMAT, header)
             payload_start = offset + HEADER_SIZE
@@ -233,9 +235,9 @@ def read_blocks(shm, role):
                 # 可能读完了整个共享内存，仍没有读完整个tensor，这时要清空共享内存并从头开始，等1秒让写方接着写
                 if len(blocks) > 0 and len(blocks) % MAX_BLOCK_NUM == 0:
                     clear_shm(shm)
-                    release_lock(shm)
+                    # release_lock(shm)
                     time.sleep(2)
-                    acquire_lock(shm)
+                    # acquire_lock(shm)
                     offset = HOST_GUEST_OFFSET + 1
         if have_blocks:
             # print(f"{role} 读，读取block数量{len(blocks)}")
@@ -244,7 +246,7 @@ def read_blocks(shm, role):
     finally:
         if should_clear:
             clear_shm(shm)
-        release_lock(shm)
+        # release_lock(shm)
 
 
 

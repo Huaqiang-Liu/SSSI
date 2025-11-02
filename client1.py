@@ -11,8 +11,18 @@ LORA_MODEL_DIR = "./model/llama-3-1b-lora"
 HOST_SHM_PATH = "/dev/shm/shm1"
 GUEST_SHM_PATH = "/sys/bus/pci/devices/0000:00:02.0/resource2"
 
-RR = 0.0001 # 轮询等待时间
-DEFAULT_DTYPE = torch.float32
+RR = 0.0005 # 轮询等待时间
+
+def set_seed(seed):
+    """设置所有相关的随机种子以确保可复现性"""
+    random.seed(seed)
+    numpy.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # 确保CUDA操作的确定性
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 # 根据host构建好模型后发来的lora相关权重和配置，初始化guest端的lora层
 class GuestLoraModel:
@@ -147,6 +157,7 @@ class SliceLinear(LoraLinear):
         # base_end = time.time()
 
         tensor_bytes = ic.tensor2bytes(x)
+        msg_id = int(time.time()) 
         request_blocks = ic.tensor_bytes_and_module_name2blocks(tensor_bytes, msg_id=0, module_name=self.module_name)
         
         # host_write_start = time.time()
@@ -198,7 +209,6 @@ def guest_main():
     open("log_bytes2tensor.txt", "w").close()
     with open(GUEST_SHM_PATH, "r+b") as f:
         shm = mmap.mmap(f.fileno(), 16 * 1024 * 1024)
-        ic.write_host_guest_uint8(shm, 1)
         while True:
             blocks = ic.read_blocks(shm, "guest")
             if len(blocks) > 0:
@@ -233,7 +243,7 @@ def guest_main():
                 delta_h = guest_lora_model.forward(module_name, input_tensor)
                 # guest_forward_end = time.time()
                 response_bytes = ic.tensor2bytes(delta_h)
-                # msg_id = int(time.time())
+                msg_id = int(time.time())
                 response_blocks = ic.tensor_bytes_and_module_name2blocks(response_bytes, msg_id=0)
                 # guest_write_start = time.time()
                 ic.write_blocks(shm, response_blocks, "guest")
@@ -244,33 +254,39 @@ def guest_main():
                 time.sleep(RR)
 
 def host_main():
+    set_seed(42)  # 设置随机种子
     open("log_host.txt", "w").close()
     open("log_tensor2bytes.txt", "w").close()
     open("log_tensor_bytes_and_module_name2blocks.txt", "w").close()
     open("log_blocks2tensor_bytes_and_module_name.txt", "w").close()
     open("log_bytes2tensor.txt", "w").close()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Host using device: {device}")
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_DIR)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     base_model = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL_DIR,
-        dtype=DEFAULT_DTYPE,
-        device_map=None,
+        dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        device_map="auto",
     )
-    base_model.to(device)
     
-    model = PeftModel.from_pretrained(base_model, LORA_MODEL_DIR, device_map=None)
-    # lora_config = LoraConfig(
-    #     r=8, 
-    #     lora_alpha=16,  
-    #     target_modules=["q_proj"], 
-    #     lora_dropout=0.05,
-    #     bias="none",
-    #     task_type="CAUSAL_LM",
+    # model = PeftModel.from_pretrained(
+    #     base_model,
+    #     LORA_MODEL_DIR,
     # )
-    # model = get_peft_model(base_model, lora_config)
+    
+    # 仅添加q_proj
+    lora_config = LoraConfig(
+        r=8, 
+        lora_alpha=16,  
+        target_modules=["q_proj"], 
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(base_model, lora_config)
     model.eval()
     
     total_time = 0.0 # host
@@ -331,33 +347,38 @@ def host_main():
     print(f"[HOST] 总时间: {total_time:.6f} 秒")
 
 def test_host(with_lora=False):
+    set_seed(42)  # 设置随机种子
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # device = torch.device("cpu")
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_DIR)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    dtype = torch.bfloat16
+
     # 先在默认位置加载 base_model（不使用 device_map="auto"），然后显式移动到目标 device
     base_model = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL_DIR,
-        torch_dtype=DEFAULT_DTYPE, # host上运行会显示torch_dtype已废弃，应该用dtype；但是guest上不用torch_dtype就会报错
+        torch_dtype=dtype,
         device_map=None,
     )
     if with_lora:
-        model = PeftModel.from_pretrained(base_model, LORA_MODEL_DIR, device_map=None)
-        # lora_config = LoraConfig(
-        #     r=8, 
-        #     lora_alpha=16,  
-        #     target_modules=["q_proj"], 
-        #     lora_dropout=0.05,
-        #     bias="none",
-        #     task_type="CAUSAL_LM",
-        # )
-        # model = get_peft_model(base_model, lora_config)
+        # model = PeftModel.from_pretrained(base_model, LORA_MODEL_DIR, device_map=None)
+        # 仅添加q_proj
+        lora_config = LoraConfig(
+            r=8, 
+            lora_alpha=16,  
+            target_modules=["q_proj"], 
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(base_model, lora_config)
     else:
         model = base_model
 
-    model.to(device=device, dtype=DEFAULT_DTYPE)
+    # 显式把整个 model 移到目标 device，并设置 dtype（多数情况下 transformers 会接受 torch_dtype，但再次确保）
+    model.to(device=device, dtype=dtype)
     model.eval()
 
     # 诊断：PeftModel 与 LoRA 层计数，以及参数设备分布
@@ -406,52 +427,15 @@ def test_host(with_lora=False):
     print(f"[HOST-ONLY{'-LoRA' if with_lora else ''}] Total (tok + gen): {(tok_end - tok_start) + (gen_end - gen_start):.6f} 秒")
 
 
-# host write, guest read, guest write, host read。这怎么会导致数据不一致？
-test_bytes = b"test" * 1048576
-test_blocks = ic.bytes2blocks(test_bytes, msg_id=1)
-def test_rw_host():
-    with open(HOST_SHM_PATH, "r+b") as f:
-        shm = mmap.mmap(f.fileno(), 16 * 1024 * 1024)
-        for _ in range(1000):
-            ic.write_blocks(shm, test_blocks, "host")
-            while True:
-                read_blocks = ic.read_blocks(shm, "host")
-                if len(read_blocks) > 0:
-                    break
-                time.sleep(RR)
-            read_bytes = ic.blocks2bytes(read_blocks)
-            try:
-                assert read_bytes == test_bytes
-            except AssertionError:
-                print(f"len of read_bytes: {len(read_bytes)}")
-
-def test_rw_guest():
-    with open(GUEST_SHM_PATH, "r+b") as f:
-        shm = mmap.mmap(f.fileno(), 16 * 1024 * 1024)
-        while True:
-            while True:
-                read_blocks = ic.read_blocks(shm, "guest")
-                if len(read_blocks) > 0:
-                    break
-                time.sleep(RR)
-            read_bytes = ic.blocks2bytes(read_blocks)
-            try:
-                assert read_bytes == test_bytes
-            except AssertionError:
-                print(f"len of read_bytes: {len(read_bytes)}")
-            ic.write_blocks(shm, test_blocks, "guest")
-
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Client for Model Inference")
     parser.add_argument("--role", choices=["host", "guest"], help="Role of the client (host or guest)")
     args = parser.parse_args()
     client_role = args.role
     if client_role == "host":
-        host_main()
-        # test_host(True)
-        # test_rw_host()
+        # host_main()
+        test_host(True)
+        # test_poll_host()
     else:
         guest_main()
-        # test_rw_guest()
+        # test_poll_guest()
