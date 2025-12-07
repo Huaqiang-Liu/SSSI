@@ -1,13 +1,19 @@
+import queue
+import threading
 import sys, os, json, time, mmap, torch, argparse, random, numpy
 from pathlib import Path
 from torch import nn
-from peft import LoraConfig, PeftModel, get_peft_model
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import LoraConfig, PeftModel, get_peft_model, PeftConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSequenceClassification
 from peft.tuners.lora.layer import Linear as LoraLinear
+from safetensors.torch import load_file, save_file
+
 import ivshmem_comm as ic
 
 BASE_MODEL_DIR = "./model/llama-3-1b-instruct"
 LORA_MODEL_DIR = "./model/llama-3-1b-lora"
+# BASE_MODEL_DIR = "./model/llama-3-1b"
+# LORA_MODEL_DIR = "./model/llama-3-1b-lora_wpl"
 HOST_SHM_PATH = "/dev/shm/shm1"
 GUEST_SHM_PATH = "/sys/bus/pci/devices/0000:00:02.0/resource2"
 
@@ -190,6 +196,30 @@ def replace_lora_layers(model: nn.Module, shm):
     return model
 
 
+def guest_worker(worker_id, guest_lora_model, input_queue, output_queue):
+    guest_forward_time = 0.0
+    tmp_guest_forward_time = 0.0
+    while True:
+        item = input_queue.get()
+        if item is None:
+            break
+        module_name, input_tensor = item
+        
+        delta_h = guest_lora_model.forward(module_name, input_tensor)
+        
+        guest_forward_start = time.time()
+        output_queue.put((worker_id, delta_h))
+        guest_forward_end = time.time()
+        tmp_guest_forward_time += guest_forward_end - guest_forward_start
+        guest_forward_time += guest_forward_end - guest_forward_start
+        # 每0.1秒输出一遍guest_forward_time
+        if tmp_guest_forward_time >= 0.02:
+            # if worker_id % 8 == 0:
+                # print(f"Worker {worker_id} - guest forward时间 {guest_forward_time:.6f} 秒")
+            print(f"Worker {worker_id} - 写入队列put时间 {guest_forward_time:.6f} 秒")
+            tmp_guest_forward_time = 0.0
+
+
 def guest_main():
     open("log_guest.txt", "w").close()
     open("log_tensor2bytes.txt", "w").close()
@@ -220,28 +250,119 @@ def guest_main():
         ic.clear_shm(shm)
         ic.write_ret_uint8(shm, 1) # 告诉host，guest端准备好了
         print("[GUEST] LoRA layers initialized. Waiting for requests...")
-        
-        while True:
-            # guest_read_start = time.time()
-            request_blocks = ic.read_blocks(shm, "guest")
-            if len(request_blocks) > 0:
-                # guest_read_end = time.time()
-                tensor_bytes, module_name = ic.blocks2tensor_bytes_and_module_name(request_blocks)
-                input_tensor = ic.bytes2tensor(tensor_bytes, use_gpu=False)
 
-                # guest_forward_start = time.time()
-                delta_h = guest_lora_model.forward(module_name, input_tensor)
-                # guest_forward_end = time.time()
-                response_bytes = ic.tensor2bytes(delta_h)
-                # msg_id = int(time.time())
-                response_blocks = ic.tensor_bytes_and_module_name2blocks(response_bytes, msg_id=0)
-                # guest_write_start = time.time()
-                ic.write_blocks(shm, response_blocks, "guest")
-                # guest_write_end = time.time()
-                # with open("log_guest.txt", "a") as log_f:
-                #     log_f.write(f"{(guest_write_end - guest_write_start + guest_read_end - guest_read_start):6f} {(guest_forward_end - guest_forward_start):6f} {(guest_write_start - guest_read_end):6f} {guest_read_start} {guest_write_end}\n")
-            else:
-                time.sleep(RR)
+        # 单线程模式
+        # all_guest_forward_time = 0.0
+        # try:
+        #     while True:
+        #         # guest_read_start = time.time()
+        #         request_blocks = ic.read_blocks(shm, "guest")
+        #         if len(request_blocks) > 0:
+        #             # guest_read_end = time.time()
+        #             tensor_bytes, module_name = ic.blocks2tensor_bytes_and_module_name(request_blocks)
+        #             input_tensor = ic.bytes2tensor(tensor_bytes, use_gpu=False)
+
+        #             guest_forward_start = time.time()
+        #             delta_h = guest_lora_model.forward(module_name, input_tensor)
+        #             guest_forward_end = time.time()
+        #             all_guest_forward_time += (guest_forward_end - guest_forward_start)
+        #             response_bytes = ic.tensor2bytes(delta_h)
+        #             # msg_id = int(time.time())
+        #             response_blocks = ic.tensor_bytes_and_module_name2blocks(response_bytes, msg_id=0)
+        #             # guest_write_start = time.time()
+        #             ic.write_blocks(shm, response_blocks, "guest")
+        #             # guest_write_end = time.time()
+        #             # with open("log_guest.txt", "a") as log_f:
+        #             #     log_f.write(f"{(guest_write_end - guest_write_start + guest_read_end - guest_read_start):6f} {(guest_forward_end - guest_forward_start):6f} {(guest_write_start - guest_read_end):6f} {guest_read_start} {guest_write_end}\n")
+        #         else:
+        #             time.sleep(RR)
+        # except KeyboardInterrupt:
+        #     print(f"guest端LoRA前向计算总时间: {all_guest_forward_time:.6f} 秒")
+        
+        
+        # 多线程模式
+        thread_num = 16
+
+        # 队列用于主线程与工作线程通信
+        input_queue = queue.Queue()
+        output_queue = queue.Queue()
+
+        # 启动工作线程
+        workers = []
+        for i in range(thread_num):
+            t = threading.Thread(target=guest_worker, args=(i, guest_lora_model, input_queue, output_queue))
+            t.daemon = True
+            t.start()
+            workers.append(t)
+        total_thread_queue_transfer_time = 0.0
+        try:
+            while True:
+                request_blocks = ic.read_blocks(shm, "guest")
+                if len(request_blocks) > 0:
+                    tensor_bytes, module_name = ic.blocks2tensor_bytes_and_module_name(request_blocks)
+                    input_tensor = ic.bytes2tensor(tensor_bytes, use_gpu=False)
+                    input_queue_start = time.time()
+                    for _ in range(thread_num):
+                        input_queue.put((module_name, input_tensor.clone()))
+                    input_queue_end = time.time()
+                    results = []
+                    # 这里只返回第一个线程的结果
+                    for _ in range(thread_num):
+                        results.append(output_queue.get())
+                    worker_id, delta_h = results[0]
+                    output_queue_end = time.time()
+                    total_thread_queue_transfer_time += (input_queue_end - input_queue_start)
+                    # total_thread_queue_transfer_time += (output_queue_end - input_queue_start)
+                    
+                    response_bytes = ic.tensor2bytes(delta_h)
+                    response_blocks = ic.tensor_bytes_and_module_name2blocks(response_bytes, msg_id=0)
+                    ic.write_blocks(shm, response_blocks, "guest")
+                else:
+                    time.sleep(RR)
+        except KeyboardInterrupt:
+            print(f"master put的总时间：{total_thread_queue_transfer_time:.6f} 秒")
+            # print(f"线程间传输数据，以及guest中并发计算时间{total_thread_queue_transfer_time:.6f} 秒")
+            # 程序退出时关闭线程
+            for _ in range(thread_num):
+                input_queue.put(None)
+            for t in workers:
+                t.join()
+
+def check_lora_weights_zero(adapter_path):
+    """检查适配器权重是否全为零"""
+    adapter_weights_path = os.path.join(adapter_path, "adapter_model.safetensors")
+    if not os.path.exists(adapter_weights_path):
+        adapter_weights_path = os.path.join(adapter_path, "adapter_model.bin")
+        if not os.path.exists(adapter_weights_path):
+            return False, []
+    
+    # 加载适配器权重
+    try:
+        if adapter_weights_path.endswith('.safetensors'):
+            state_dict = load_file(adapter_weights_path)
+        else:
+            state_dict = torch.load(adapter_weights_path, map_location='cpu')
+    except:
+        return False, []
+    
+    unzero_modules = []
+    
+    # 检查每个LoRA权重是否全为零
+    for key in state_dict.keys():
+        if 'lora' in key.lower():
+            weight = state_dict[key]
+            # print(key,weight,torch.allclose(weight, torch.zeros_like(weight), atol=1e-4))
+            # st()
+            if not torch.allclose(weight, torch.zeros_like(weight), atol=1e-4):
+                parts = key.split('.')
+                new_key = '.'.join(parts[2:-2])
+                if new_key not in unzero_modules:
+                    unzero_modules.append(new_key)
+
+    return len(unzero_modules) > 0, unzero_modules
+
+
+
 
 def host_main():
     open("log_host.txt", "w").close()
@@ -249,6 +370,7 @@ def host_main():
     open("log_tensor_bytes_and_module_name2blocks.txt", "w").close()
     open("log_blocks2tensor_bytes_and_module_name.txt", "w").close()
     open("log_bytes2tensor.txt", "w").close()
+    print("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_DIR)
     if tokenizer.pad_token is None:
@@ -261,7 +383,10 @@ def host_main():
     )
     base_model.to(device)
     
+    # 如果用全量lora
     model = PeftModel.from_pretrained(base_model, LORA_MODEL_DIR, device_map=None)
+
+    # 如果只加载q_proj
     # lora_config = LoraConfig(
     #     r=8, 
     #     lora_alpha=16,  
@@ -271,6 +396,22 @@ def host_main():
     #     task_type="CAUSAL_LM",
     # )
     # model = get_peft_model(base_model, lora_config)
+
+    # 如果加载剪枝后的lora
+    # _, unzero_modules = check_lora_weights_zero(LORA_MODEL_DIR)
+    # print(f"非零LoRA模块有: {unzero_modules}")
+    # lora_config = LoraConfig(
+    #     r=8, 
+    #     lora_alpha=16,  
+    #     target_modules=unzero_modules, 
+    #     lora_dropout=0.05,
+    #     bias="none",
+    #     task_type="CAUSAL_LM",
+    # )
+    # model = get_peft_model(base_model, lora_config)
+    # print(f"完整模型架构: {model}")
+
+    # 结束讨论
     model.eval()
     
     total_time = 0.0 # host
@@ -344,7 +485,8 @@ def test_host(with_lora=False):
         device_map=None,
     )
     if with_lora:
-        model = PeftModel.from_pretrained(base_model, LORA_MODEL_DIR, device_map=None)
+        # model = PeftModel.from_pretrained(base_model, LORA_MODEL_DIR, device_map=None)
+        
         # lora_config = LoraConfig(
         #     r=8, 
         #     lora_alpha=16,  
@@ -354,6 +496,19 @@ def test_host(with_lora=False):
         #     task_type="CAUSAL_LM",
         # )
         # model = get_peft_model(base_model, lora_config)
+
+        _, unzero_modules = check_lora_weights_zero(LORA_MODEL_DIR)
+        print(f"非零LoRA模块有: {unzero_modules}")
+        lora_config = LoraConfig(
+            r=8, 
+            lora_alpha=16,  
+            target_modules=unzero_modules, 
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(base_model, lora_config)
+        print(f"完整模型架构: {model}")
     else:
         model = base_model
 
