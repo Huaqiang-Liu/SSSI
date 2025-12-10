@@ -4,16 +4,50 @@ import sys, os, json, time, mmap, torch, argparse, random, numpy
 from pathlib import Path
 from torch import nn
 from peft import LoraConfig, PeftModel, get_peft_model, PeftConfig
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSequenceClassification
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSequenceClassification, AutoModelForQuestionAnswering
 from peft.tuners.lora.layer import Linear as LoraLinear
 from safetensors.torch import load_file, save_file
 
 import ivshmem_comm as ic
 
-BASE_MODEL_DIR = "./model/llama-3-1b-instruct"
-LORA_MODEL_DIR = "./model/llama-3-1b-lora"
-# BASE_MODEL_DIR = "./model/llama-3-1b"
-# LORA_MODEL_DIR = "./model/llama-3-1b-lora_wpl"
+# 不同prompt
+PROMPT_DATABASE = "sst2"
+# PROMPT_DATABASE = "squad"
+# PROMPT_DATABASE = "mnli"
+
+# lora剪枝与否
+PRUNED = False
+
+# 不同base model
+BASE_MODEL = "llama-3-1b"
+# BASE_MODEL = "gpt2-large"
+
+# 不同lora模型
+LORA_DATABASE = "sst2"
+# LORA_DATABASE = "squad"
+# LORA_DATABASE = "mnli"
+
+# 我们的方法/纯GPU|CPU
+TEST_OUR_METHOD = True
+
+# 剪枝率
+# PRUNE_RATIO = 0.8 # 和sst2绑定
+# PRUNE_RATIO = 0.64 # 和squad绑定
+# PRUNE_RATIO = 0.82 # 目前只有squad数据集，暂时不用
+PRUNE_RATIO = 0.8 if LORA_DATABASE == "sst2" else (0.64 if LORA_DATABASE == "squad" else 0.82)
+
+
+base_model_dir = f"./model/{BASE_MODEL}"
+lora_model_dir = f"./model/{BASE_MODEL}-lora{f"/dynamic/ratio={PRUNE_RATIO}" if PRUNED else ""}/{LORA_DATABASE}"
+
+print(lora_model_dir)
+
+sst2_prompt = "hide new secretions from the parental units" # 是不是应该告知模型这是一个情感分类任务？
+mnli_prompt = ""
+squad_prompt = "Architecturally, the school has a Catholic character. Atop the Main Building's gold dome is a golden statue of the Virgin Mary. Immediately in front of the Main Building and facing it, is a copper statue of Christ with arms upraised with the legend \"Venite Ad Me Omnes\". Next to the Main Building is the Basilica of the Sacred Heart. Immediately behind the basilica is the Grotto, a Marian place of prayer and reflection. It is a replica of the grotto at Lourdes, France where the Virgin Mary reputedly appeared to Saint Bernadette Soubirous in 1858. At the end of the main drive (and in a direct line that connects through 3 statues and the Gold Dome), is a simple, modern stone statue of Mary.\n\nQuestion: What sits on top of the Main Building at Notre Dame?"
+# PROMPT = "How many states does the US have?"
+prompt = sst2_prompt if PROMPT_DATABASE == "sst2" else (squad_prompt if PROMPT_DATABASE == "squad" else mnli_prompt)
+
 HOST_SHM_PATH = "/dev/shm/shm1"
 GUEST_SHM_PATH = "/sys/bus/pci/devices/0000:00:02.0/resource2"
 
@@ -196,36 +230,62 @@ def replace_lora_layers(model: nn.Module, shm):
     return model
 
 
-def guest_worker(worker_id, guest_lora_model, input_queue, output_queue):
-    guest_forward_time = 0.0
-    tmp_guest_forward_time = 0.0
+shared_state = {
+    'request_id': 0,
+    'module_name': None,
+    'input_tensor': None,
+    'exit_signal': False # 退出信号
+}
+
+def guest_worker(worker_id, guest_lora_model, condition, output_queue):
+    global shared_state
+    guest_forward_time = 0.0    
+    # 追踪该 worker 已经处理的请求 ID，避免重复处理
+    last_processed_id = 0
+    # if worker_id == 0:
+    #     log_f = open("log_guest_worker_0.txt", "a")
+    
     while True:
-        item = input_queue.get()
-        if item is None:
-            break
-        module_name, input_tensor = item
+        # 局部变量，用于存储本次处理的数据
+        module_name, input_tensor = None, None
         
-        delta_h = guest_lora_model.forward(module_name, input_tensor)
+        with condition:
+            # 循环等待：只有当 request_id 大于该 worker 上次处理的 ID 时才退出等待
+            # 或者收到退出信号时退出等待
+            while shared_state['request_id'] == last_processed_id and not shared_state['exit_signal']:
+                condition.wait()
+            
+            # 检查退出信号
+            if shared_state['exit_signal']:
+                print(f"Worker {worker_id} - forward时间累计 {guest_forward_time:.6f} 秒")
+                break
+            
+            # 确定是新数据：更新已处理 ID，并读取共享数据引用
+            last_processed_id = shared_state['request_id']
+            module_name = shared_state['module_name']
+            input_tensor = shared_state['input_tensor']
         
         guest_forward_start = time.time()
-        output_queue.put((worker_id, delta_h))
+        # 将开始执行的时间戳写入log_guest_worker_0.txt
+        # if worker_id == 0:
+        #     log_f.write(f"{guest_forward_start}\n")
+        delta_h = guest_lora_model.forward(module_name, input_tensor)
         guest_forward_end = time.time()
-        tmp_guest_forward_time += guest_forward_end - guest_forward_start
+        # if worker_id == 0:
+        #     log_f.write(f"{guest_forward_end}\n")
+        output_queue.put((worker_id, delta_h))
+
         guest_forward_time += guest_forward_end - guest_forward_start
-        # 每0.1秒输出一遍guest_forward_time
-        if tmp_guest_forward_time >= 0.02:
-            # if worker_id % 8 == 0:
-                # print(f"Worker {worker_id} - guest forward时间 {guest_forward_time:.6f} 秒")
-            print(f"Worker {worker_id} - 写入队列put时间 {guest_forward_time:.6f} 秒")
-            tmp_guest_forward_time = 0.0
 
 
-def guest_main():
+def guest_main(set_multi_thread=False):
     open("log_guest.txt", "w").close()
     open("log_tensor2bytes.txt", "w").close()
     open("log_tensor_bytes_and_module_name2blocks.txt", "w").close()
     open("log_blocks2tensor_bytes_and_module_name.txt", "w").close()
     open("log_bytes2tensor.txt", "w").close()
+    open("log_guest_master.txt", "w").close()
+    open("log_guest_worker_0.txt", "w").close()
     with open(GUEST_SHM_PATH, "r+b") as f:
         shm = mmap.mmap(f.fileno(), 16 * 1024 * 1024)
         ic.write_host_guest_uint8(shm, 1)
@@ -252,81 +312,101 @@ def guest_main():
         print("[GUEST] LoRA layers initialized. Waiting for requests...")
 
         # 单线程模式
-        # all_guest_forward_time = 0.0
-        # try:
-        #     while True:
-        #         # guest_read_start = time.time()
-        #         request_blocks = ic.read_blocks(shm, "guest")
-        #         if len(request_blocks) > 0:
-        #             # guest_read_end = time.time()
-        #             tensor_bytes, module_name = ic.blocks2tensor_bytes_and_module_name(request_blocks)
-        #             input_tensor = ic.bytes2tensor(tensor_bytes, use_gpu=False)
+        if not set_multi_thread:
+            all_guest_forward_time = 0.0
+            try:
+                while True:
+                    # guest_read_start = time.time()
+                    request_blocks = ic.read_blocks(shm, "guest")
+                    if len(request_blocks) > 0:
+                        # guest_read_end = time.time()
+                        tensor_bytes, module_name = ic.blocks2tensor_bytes_and_module_name(request_blocks)
+                        input_tensor = ic.bytes2tensor(tensor_bytes, use_gpu=False)
 
-        #             guest_forward_start = time.time()
-        #             delta_h = guest_lora_model.forward(module_name, input_tensor)
-        #             guest_forward_end = time.time()
-        #             all_guest_forward_time += (guest_forward_end - guest_forward_start)
-        #             response_bytes = ic.tensor2bytes(delta_h)
-        #             # msg_id = int(time.time())
-        #             response_blocks = ic.tensor_bytes_and_module_name2blocks(response_bytes, msg_id=0)
-        #             # guest_write_start = time.time()
-        #             ic.write_blocks(shm, response_blocks, "guest")
-        #             # guest_write_end = time.time()
-        #             # with open("log_guest.txt", "a") as log_f:
-        #             #     log_f.write(f"{(guest_write_end - guest_write_start + guest_read_end - guest_read_start):6f} {(guest_forward_end - guest_forward_start):6f} {(guest_write_start - guest_read_end):6f} {guest_read_start} {guest_write_end}\n")
-        #         else:
-        #             time.sleep(RR)
-        # except KeyboardInterrupt:
-        #     print(f"guest端LoRA前向计算总时间: {all_guest_forward_time:.6f} 秒")
-        
-        
-        # 多线程模式
-        thread_num = 16
+                        guest_forward_start = time.time()
+                        delta_h = guest_lora_model.forward(module_name, input_tensor)
+                        guest_forward_end = time.time()
+                        all_guest_forward_time += (guest_forward_end - guest_forward_start)
+                        response_bytes = ic.tensor2bytes(delta_h)
+                        # msg_id = int(time.time())
+                        response_blocks = ic.tensor_bytes_and_module_name2blocks(response_bytes, msg_id=0)
+                        # guest_write_start = time.time()
+                        ic.write_blocks(shm, response_blocks, "guest")
+                        # guest_write_end = time.time()
+                        # with open("log_guest.txt", "a") as log_f:
+                        #     log_f.write(f"{(guest_write_end - guest_write_start + guest_read_end - guest_read_start):6f} {(guest_forward_end - guest_forward_start):6f} {(guest_write_start - guest_read_end):6f} {guest_read_start} {guest_write_end}\n")
+                    else:
+                        time.sleep(RR)
+            except KeyboardInterrupt:
+                print(f"guest端LoRA前向计算总时间: {all_guest_forward_time:.6f} 秒")
+        else:    
+            # 多线程模式
+            thread_num = 32
 
-        # 队列用于主线程与工作线程通信
-        input_queue = queue.Queue()
-        output_queue = queue.Queue()
+            global shared_state
+            # Condition 对象用于同步：主线程通知，工作线程等待
+            condition = threading.Condition()
+            output_queue = queue.Queue()
 
-        # 启动工作线程
-        workers = []
-        for i in range(thread_num):
-            t = threading.Thread(target=guest_worker, args=(i, guest_lora_model, input_queue, output_queue))
-            t.daemon = True
-            t.start()
-            workers.append(t)
-        total_thread_queue_transfer_time = 0.0
-        try:
-            while True:
-                request_blocks = ic.read_blocks(shm, "guest")
-                if len(request_blocks) > 0:
-                    tensor_bytes, module_name = ic.blocks2tensor_bytes_and_module_name(request_blocks)
-                    input_tensor = ic.bytes2tensor(tensor_bytes, use_gpu=False)
-                    input_queue_start = time.time()
-                    for _ in range(thread_num):
-                        input_queue.put((module_name, input_tensor.clone()))
-                    input_queue_end = time.time()
-                    results = []
-                    # 这里只返回第一个线程的结果
-                    for _ in range(thread_num):
-                        results.append(output_queue.get())
-                    worker_id, delta_h = results[0]
-                    output_queue_end = time.time()
-                    total_thread_queue_transfer_time += (input_queue_end - input_queue_start)
-                    # total_thread_queue_transfer_time += (output_queue_end - input_queue_start)
+            # 启动工作线程
+            workers = []
+            for i in range(thread_num):
+                t = threading.Thread(target=guest_worker, 
+                                    args=(i, guest_lora_model, condition, output_queue))
+                t.daemon = True
+                t.start()
+                workers.append(t)
+                
+            total_broadcast_overhead = 0.0 # 记录主线程广播（写共享内存和通知）的开销
+            total_request_latency = 0.0    # 记录从请求开始到收到第一个结果的总时间
+
+            # 将notify workers的时间戳写入log_guest_master.txt
+            log_f = open("log_guest_master.txt", "a")
+            try:
+                while True:
+                    request_blocks = ic.read_blocks(shm, "guest")
+                    if len(request_blocks) > 0:
+                        tensor_bytes, module_name = ic.blocks2tensor_bytes_and_module_name(request_blocks)
+                        input_tensor = ic.bytes2tensor(tensor_bytes, use_gpu=False)
+
+                        request_start_time = time.time()
+                        with condition:
+                            shared_state['request_id'] += 1 
+                            shared_state['module_name'] = module_name
+                            shared_state['input_tensor'] = input_tensor
+                            condition.notify_all()
+                        call_workers_end_time = time.time()
+                        # log_f.write(f"{call_workers_end_time}\n")
+                        total_broadcast_overhead += call_workers_end_time - request_start_time
+                        
+                        results = []
+                        for _ in range(thread_num):
+                            results.append(output_queue.get())
+                        request_end_time = time.time()
+                        log_f.write(f"{request_end_time}\n")
+
+                        total_request_latency += (request_end_time - request_start_time)
+                        
+                        worker_id, delta_h = results[0]
+                        
+                        response_bytes = ic.tensor2bytes(delta_h)
+                        response_blocks = ic.tensor_bytes_and_module_name2blocks(response_bytes, msg_id=0)
+                        ic.write_blocks(shm, response_blocks, "guest")
+                    else:
+                        time.sleep(RR)
                     
-                    response_bytes = ic.tensor2bytes(delta_h)
-                    response_blocks = ic.tensor_bytes_and_module_name2blocks(response_bytes, msg_id=0)
-                    ic.write_blocks(shm, response_blocks, "guest")
-                else:
-                    time.sleep(RR)
-        except KeyboardInterrupt:
-            print(f"master put的总时间：{total_thread_queue_transfer_time:.6f} 秒")
-            # print(f"线程间传输数据，以及guest中并发计算时间{total_thread_queue_transfer_time:.6f} 秒")
-            # 程序退出时关闭线程
-            for _ in range(thread_num):
-                input_queue.put(None)
-            for t in workers:
-                t.join()
+            except KeyboardInterrupt:
+                print(f"主线程广播（写共享内存和通知）总开销: {total_broadcast_overhead:.6f} 秒")
+                print(f"请求处理总延迟（从开始广播到收到所有结果）: {total_request_latency:.6f} 秒")
+                
+                with condition:
+                    shared_state['exit_signal'] = True
+                    condition.notify_all()
+                    
+                for t in workers:
+                    t.join()
+                
+                log_f.close()
 
 def check_lora_weights_zero(adapter_path):
     """检查适配器权重是否全为零"""
@@ -372,46 +452,37 @@ def host_main():
     open("log_bytes2tensor.txt", "w").close()
     print("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_DIR)
+    tokenizer = AutoTokenizer.from_pretrained(base_model_dir)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     base_model = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL_DIR,
+    # base_model = AutoModelForQuestionAnswering.from_pretrained(
+        base_model_dir,
         dtype=DEFAULT_DTYPE,
         device_map=None,
     )
     base_model.to(device)
+    print(f"base model架构：{base_model}")
     
-    # 如果用全量lora
-    model = PeftModel.from_pretrained(base_model, LORA_MODEL_DIR, device_map=None)
-
-    # 如果只加载q_proj
-    # lora_config = LoraConfig(
-    #     r=8, 
-    #     lora_alpha=16,  
-    #     target_modules=["q_proj"], 
-    #     lora_dropout=0.05,
-    #     bias="none",
-    #     task_type="CAUSAL_LM",
-    # )
-    # model = get_peft_model(base_model, lora_config)
-
     # 如果加载剪枝后的lora
-    # _, unzero_modules = check_lora_weights_zero(LORA_MODEL_DIR)
-    # print(f"非零LoRA模块有: {unzero_modules}")
-    # lora_config = LoraConfig(
-    #     r=8, 
-    #     lora_alpha=16,  
-    #     target_modules=unzero_modules, 
-    #     lora_dropout=0.05,
-    #     bias="none",
-    #     task_type="CAUSAL_LM",
-    # )
-    # model = get_peft_model(base_model, lora_config)
-    # print(f"完整模型架构: {model}")
+    if PRUNED:
+        _, unzero_modules = check_lora_weights_zero(lora_model_dir)
+        print(f"非零LoRA模块有: {unzero_modules}")
+        lora_config = LoraConfig(
+            r=8, 
+            lora_alpha=16,  
+            target_modules=unzero_modules, 
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(base_model, lora_config)
+        # print(f"完整模型架构: {model}")
+    # 全量lora
+    else:
+        model = PeftModel.from_pretrained(base_model, lora_model_dir, device_map=None)
 
-    # 结束讨论
     model.eval()
     
     total_time = 0.0 # host
@@ -444,8 +515,6 @@ def host_main():
     init_end = time.time()
     init_time = init_end - init_start
     print("[HOST] 推理开始")
-    prompt = "How many states does the US have?"
-    # prompt = "Say \"Hello\", do not include other words."
     inputs = tokenizer(
         prompt,
         return_tensors="pt",
@@ -467,38 +536,28 @@ def host_main():
     print(output_text)
     total_end = time.time()
     total_time = total_end - init_start
-    print(f"[HOST] 初始化时间: {init_time:.6f} 秒")
+    # print(f"[HOST] 初始化时间: {init_time:.6f} 秒")
     print(f"[HOST] 生成时间: {gen_end - gen_start:.6f} 秒")
-    print(f"[HOST] 总时间: {total_time:.6f} 秒")
+    print(f"[HOST] 输出token数: {len(output_ids[0])}")
+    # print(f"[HOST] 总时间: {total_time:.6f} 秒")
 
-def test_host(with_lora=False):
+def test_host():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # device = torch.device("cpu")
-    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_DIR)
+    tokenizer = AutoTokenizer.from_pretrained(base_model_dir)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     # 先在默认位置加载 base_model（不使用 device_map="auto"），然后显式移动到目标 device
     base_model = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL_DIR,
+        base_model_dir,
         torch_dtype=DEFAULT_DTYPE, # host上运行会显示torch_dtype已废弃，应该用dtype；但是guest上不用torch_dtype就会报错
         device_map=None,
     )
-    if with_lora:
-        # model = PeftModel.from_pretrained(base_model, LORA_MODEL_DIR, device_map=None)
-        
-        # lora_config = LoraConfig(
-        #     r=8, 
-        #     lora_alpha=16,  
-        #     target_modules=["q_proj"], 
-        #     lora_dropout=0.05,
-        #     bias="none",
-        #     task_type="CAUSAL_LM",
-        # )
-        # model = get_peft_model(base_model, lora_config)
-
-        _, unzero_modules = check_lora_weights_zero(LORA_MODEL_DIR)
-        print(f"非零LoRA模块有: {unzero_modules}")
+    # 剪枝lora
+    if PRUNED:
+        _, unzero_modules = check_lora_weights_zero(lora_model_dir)
+        # print(f"非零LoRA模块有: {unzero_modules}")
         lora_config = LoraConfig(
             r=8, 
             lora_alpha=16,  
@@ -508,9 +567,10 @@ def test_host(with_lora=False):
             task_type="CAUSAL_LM",
         )
         model = get_peft_model(base_model, lora_config)
-        print(f"完整模型架构: {model}")
+        # print(f"完整模型架构: {model}")
+    # 全量lora
     else:
-        model = base_model
+        model = PeftModel.from_pretrained(base_model, lora_model_dir, device_map=None)
 
     model.to(device=device, dtype=DEFAULT_DTYPE)
     model.eval()
@@ -531,19 +591,13 @@ def test_host(with_lora=False):
         device_counts[d] = device_counts.get(d, 0) + 1
     print("Parameter device distribution (device: param_count):", device_counts)
 
-    # 计时与推理
-    prompt = "How many states does the US have?"
-    tok_start = time.time()
     inputs = tokenizer(
         prompt,
         return_tensors="pt",
         padding=True,
         truncation=True
     )
-    # 将输入张量移动到 device
     inputs = {k: v.to(device) for k, v in inputs.items()}
-    tok_end = time.time()
-    print(f"Tokenization + .to(device) time: {tok_end - tok_start:.6f} 秒")
 
     gen_start = time.time()
     with torch.no_grad():
@@ -557,8 +611,8 @@ def test_host(with_lora=False):
 
     output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
     print(output_text)
-    print(f"[HOST-ONLY{'-LoRA' if with_lora else ''}] Generation time (only): {gen_end - gen_start:.6f} 秒")
-    print(f"[HOST-ONLY{'-LoRA' if with_lora else ''}] Total (tok + gen): {(tok_end - tok_start) + (gen_end - gen_start):.6f} 秒")
+    print(f"[HOST-ONLY] 推理时间: {gen_end - gen_start:.6f} 秒")
+    print(f"[HOST-ONLY] 输出token数: {len(output_ids[0])}")
 
 
 # host write, guest read, guest write, host read。这怎么会导致数据不一致？
@@ -604,9 +658,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
     client_role = args.role
     if client_role == "host":
-        host_main()
-        # test_host(True)
+        if TEST_OUR_METHOD:
+            host_main()
+        else:
+            test_host()
         # test_rw_host()
     else:
-        guest_main()
-        # test_rw_guest()
+        if not TEST_OUR_METHOD:
+            test_host()
+        else:
+            guest_main(set_multi_thread=False)
+            # test_rw_guest()
