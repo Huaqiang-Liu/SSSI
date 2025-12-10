@@ -12,27 +12,31 @@ from pdb import set_trace as st
 import ivshmem_comm as ic
 
 # 不同prompt
-# PROMPT_DATABASE = "sst2"
-PROMPT_DATABASE = "squad"
+
+PROMPT_DATABASE = "sst2"
+#PROMPT_DATABASE = "squad"
 # PROMPT_DATABASE = "mnli"
 
 # lora剪枝与否
-PRUNED = False
+PRUNED = True
 
 # 不同base model
 BASE_MODEL = "llama-3-1b"
-# BASE_MODEL = "gpt2-large"
+BASE_MODEL = "gpt2-large"
 
 # 不同lora模型
 LORA_DATABASE = "sst2"
-# LORA_DATABASE = "squad"
+#LORA_DATABASE = "squad"
 # LORA_DATABASE = "mnli"
 
 # 我们的方法/纯GPU|CPU
-TEST_OUR_METHOD = True
+TEST_OUR_METHOD = False
 
-# 剪枝率：0.8和sst2绑定，0.64和squad绑定，0.66和mnli绑定
-PRUNE_RATIO = 0.8 if LORA_DATABASE == "sst2" else (0.64 if LORA_DATABASE == "squad" else 0.66)
+# 剪枝率
+# PRUNE_RATIO = 0.8 # 和sst2绑定
+# PRUNE_RATIO = 0.64 # 和squad绑定
+# PRUNE_RATIO = 0.82 # 目前只有squad数据集，暂时不用
+PRUNE_RATIO = 0.8 if LORA_DATABASE == "sst2" else (0.64 if LORA_DATABASE == "squad" else 0.82)
 
 
 base_model_dir = f"./model/{BASE_MODEL}"
@@ -408,6 +412,7 @@ def guest_main(set_multi_thread=False):
 
 def check_lora_weights_zero(adapter_path):
     """检查适配器权重是否全为零"""
+        
     adapter_weights_path = os.path.join(adapter_path, "adapter_model.safetensors")
     if not os.path.exists(adapter_weights_path):
         adapter_weights_path = os.path.join(adapter_path, "adapter_model.bin")
@@ -428,7 +433,6 @@ def check_lora_weights_zero(adapter_path):
     # 检查每个LoRA权重是否全为零
     for key in state_dict.keys():
         if 'lora' in key.lower():
-            # print(key)
             #st()
             weight = state_dict[key]
             # print(key,weight,torch.allclose(weight, torch.zeros_like(weight), atol=1e-4))
@@ -447,9 +451,9 @@ def check_lora_weights_zero(adapter_path):
 
     return len(unzero_modules) > 0, unzero_modules
 
-
 def check_lora_weights(adapter_path):
-    """特判llama的模块命名问题"""
+    """检查适配器权重是否全为零"""
+        
     adapter_weights_path = os.path.join(adapter_path, "adapter_model.safetensors")
     if not os.path.exists(adapter_weights_path):
         adapter_weights_path = os.path.join(adapter_path, "adapter_model.bin")
@@ -470,7 +474,6 @@ def check_lora_weights(adapter_path):
     # 检查每个LoRA权重是否全为零
     for key in state_dict.keys():
         if 'lora' in key.lower():
-            # print(key)
             #st()
             weight = state_dict[key]
             if "transformer" in key and "llama" in BASE_MODEL.lower():
@@ -484,6 +487,7 @@ def check_lora_weights(adapter_path):
                 if new_key not in lora_modules:
                     lora_modules.append(new_key)
     return len(lora_modules) > 0, lora_modules
+
 
 
 def host_main():
@@ -505,12 +509,12 @@ def host_main():
         device_map=None,
     )
     base_model.to(device)
-    # print(f"base model架构：{base_model}")
+    print(f"base model架构：{base_model}")
     
-    # 剪枝lora
+    # 如果加载剪枝后的lora
     if PRUNED:
         _, unzero_modules = check_lora_weights_zero(lora_model_dir)
-        # print(f"非零LoRA模块有: {unzero_modules}")
+        print(f"非零LoRA模块有: {unzero_modules}")
         lora_config = LoraConfig(
             r=8, 
             lora_alpha=16,  
@@ -519,36 +523,19 @@ def host_main():
             bias="none",
             task_type="CAUSAL_LM",
         )
-        model = get_peft_model(base_model, lora_config)
-        state_dict = load_file(os.path.join(lora_model_dir, "adapter_model.safetensors"), device="cuda" if torch.cuda.is_available() else "cpu")
-        model.load_state_dict(state_dict, strict=False)
-
-        # for name, param in model.named_parameters():
-        #     if "lora" in name.lower():
-        #         print(name, param)
-
+        #model = get_peft_model(base_model, lora_config)
+        print(base_model)
+        model = PeftModel.from_pretrained(
+            base_model, 
+            lora_model_dir,
+            config=lora_config,
+            #torch_dtype=torch.bfloat16
+        )
         # print(f"完整模型架构: {model}")
     # 全量lora
     else:
-        _, lora_modules = check_lora_weights(lora_model_dir)
-        lora_config = LoraConfig(
-            r=8, 
-            lora_alpha=16,  
-            target_modules=lora_modules, 
-            lora_dropout=0.05,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        # print(f"LoRA模块有: {lora_modules}")
-        model = get_peft_model(base_model, lora_config)
-        state_dict = load_file(os.path.join(lora_model_dir, "adapter_model.safetensors"), device="cuda" if torch.cuda.is_available() else "cpu")
-        model.load_state_dict(state_dict, strict=False)
+        model = PeftModel.from_pretrained(base_model, lora_model_dir, device_map=None)
 
-        # for name, param in model.named_parameters():
-        #     if "lora" in name.lower():
-        #         print(name, param)
-
-        # print(f"完整模型架构: {model}")
     model.eval()
     
     total_time = 0.0 # host
@@ -632,10 +619,41 @@ def test_host():
             bias="none",
             task_type="CAUSAL_LM",
         )
+        #print(base_model)
+        print(unzero_modules)
+        print(lora_model_dir)
+        # model = PeftModel.from_pretrained(
+        #     base_model, 
+        #     lora_model_dir,
+        #     config=lora_config,
+        #     #torch_dtype=torch.bfloat16
+        # )
         model = get_peft_model(base_model, lora_config)
-        state_dict = load_file(os.path.join(lora_model_dir, "adapter_model.safetensors"), device="cuda" if torch.cuda.is_available() else "cpu")
-        model.load_state_dict(state_dict, strict=False)
-        # print(f"完整模型架构: {model}")
+        state_dict = load_file(os.path.join(lora_model_dir, "adapter_model.safetensors"), device='cpu')
+        for name, param in model.named_parameters():
+            if "lora" in name.lower():
+                parts = name.split('.')
+                if "squad" in PROMPT_DATABASE and "llama" in BASE_MODEL.lower():
+                    new_name = '.'.join(parts[3:-3])
+                    new_name2 = '.'.join(parts[3:-2])
+                else:
+                    new_name = '.'.join(parts[2:-3])
+                    new_name2 = '.'.join(parts[2:-2])
+                # print(new_name, new_name2)
+                # st()
+                if new_name in unzero_modules:
+                    #print(f"加载LoRA权重: {name}")
+                    for state_dict_key in state_dict.keys():
+                        if new_name2 in state_dict_key:
+                            param.data = state_dict[state_dict_key]
+                            print(f"加载LoRA权重: {name} 从 {state_dict_key}")
+                            print(name, param)
+        st()
+
+        # print(state_dict['base_model.model.transformer.layers.0.self_attn.q_proj.lora_A.weight'])
+        # for name, param in model.named_parameters():
+        #     if "lora" in name.lower():
+        #         print(name, param)
     # 全量lora
     else:
         _, lora_modules = check_lora_weights(lora_model_dir)
@@ -647,10 +665,28 @@ def test_host():
             bias="none",
             task_type="CAUSAL_LM",
         )
-        # print(f"LoRA模块有: {lora_modules}")
+        print(f"LoRA模块有: {lora_modules}")
         model = get_peft_model(base_model, lora_config)
-        state_dict = load_file(os.path.join(lora_model_dir, "adapter_model.safetensors"), device="cuda" if torch.cuda.is_available() else "cpu")
-        model.load_state_dict(state_dict, strict=False)
+        state_dict = load_file(os.path.join(lora_model_dir, "adapter_model.safetensors"), device='cpu')
+
+        for name, param in model.named_parameters():
+            if "lora" in name.lower():
+                parts = name.split('.')
+                if "squad" in PROMPT_DATABASE and "llama" in BASE_MODEL.lower():
+                    new_name = '.'.join(parts[3:-3])
+                    new_name2 = '.'.join(parts[3:-2])
+                else:
+                    new_name = '.'.join(parts[2:-3])
+                    new_name2 = '.'.join(parts[2:-2])
+                if new_name in lora_modules:
+                    #print(f"加载LoRA权重: {name}")
+                    for state_dict_key in state_dict.keys():
+                        if new_name2 in state_dict_key:
+                            param.data = state_dict[state_dict_key]
+                            print(f"加载LoRA权重: {name} 从 {state_dict_key}")
+                            print(name, param)
+        st()
+        #model = PeftModel.from_pretrained(base_model, lora_model_dir, device_map=None)
 
     model.to(device=device, dtype=DEFAULT_DTYPE)
     model.eval()
