@@ -2,3 +2,6 @@
 __pycache__/
 *.txt
 /deprecated_model/
+clinet_wpl.py
+client1.py
+jhl.md
