@@ -1,14 +1,13 @@
-# 加载并切分llama2-7b模型层
+# 加载并切分llama3-1b模型层
 import torch
 import safetensors.torch
 from pathlib import Path
 from llama_model import ModelArgs, Transformer
 import os
 import json
-
+torch.set_default_device("cpu")
 # 为了方便，仅支持本地
-def partition_model(model_path="model/llama2", output_dir="model/llama2-partitioned"):
-    import json
+def partition_model(model_path, output_dir):
     os.makedirs(output_dir, exist_ok=True)
     
     config_path = os.path.join(model_path, "config.json")
@@ -19,8 +18,6 @@ def partition_model(model_path="model/llama2", output_dir="model/llama2-partitio
 
     with open(config_path, "r") as f:
         config = json.load(f)
-
-    from llama_model import ModelArgs, Transformer
 
     model_args = ModelArgs(
         dim=config["hidden_size"],
@@ -34,9 +31,16 @@ def partition_model(model_path="model/llama2", output_dir="model/llama2-partitio
         ffn_dim_multiplier=config["intermediate_size"] / config["hidden_size"],
     )
 
-    model = Transformer(model_args)
-    state_dict = safetensors.torch.load_file(weights_path, device="cpu")
-    model.load_state_dict(state_dict, strict=False)
+    # model = Transformer(model_args).cpu()
+    with torch.no_grad():
+        model = Transformer(model_args).cpu()
+
+    # state_dict = safetensors.torch.load_file(weights_path, device="cpu")
+    # model.load_state_dict(state_dict, strict=False)
+    model.load_state_dict(
+        safetensors.torch.load_file(weights_path, device="cpu"),
+        strict=False
+    )
 
     for i, layer in enumerate(model.layers):
         torch.save(layer.state_dict(), os.path.join(output_dir, f"layer_{i}.pt")) # 存放transformer层的权重
@@ -47,4 +51,4 @@ def partition_model(model_path="model/llama2", output_dir="model/llama2-partitio
     print(f"模型分割完成，保存至: {output_dir}")
 
 if __name__ == "__main__":
-    partition_model(model_path="model/llama2", output_dir="model/llama2-partitioned")
+    partition_model(model_path="/home/user/workspace/lhq/sssi/model/llama-3-1b", output_dir="model/llama3-partitioned")

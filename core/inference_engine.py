@@ -14,9 +14,9 @@ from safetensors.torch import load_file as safe_load
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
-PAR_MODEL_DIR = "model/llama2-partitioned"
-MODEL_DIR = "model/llama2"
-TOKENIZER_PATH = "model/llama2/tokenizer.model"
+PAR_MODEL_DIR = "model/llama3-partitioned"
+MODEL_DIR = "model/llama-3-1b/"
+TOKENIZER_PATH = "model/llama-3-1b"
 
 
 def load_partitioned_model(model_dir: str, use_gpu: bool, start_layer_idx: int = 0, end_layer_idx: int = -1):
@@ -189,7 +189,11 @@ def generate(
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
-    tokenizer = Tokenizer(model_path=TOKENIZER_PATH)
+    # tokenizer = Tokenizer(model_path=TOKENIZER_PATH)
+    tokenizer = AutoTokenizer.from_pretrained(
+        TOKENIZER_PATH,
+        use_fast=False,
+    )
     input_text = "How many states does the US have?"
     max_gen_tokens = 64
     temp = 0.0

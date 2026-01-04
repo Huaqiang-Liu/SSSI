@@ -120,26 +120,31 @@ class Attention(nn.Module):
             args.dim,
             bias=False,
         )
+        
+        self.max_seq_len = args.max_seq_len
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.cache_k = torch.zeros(
-            (
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-            ),
-            device=device
-        )
-        self.cache_v = torch.zeros(
-            (
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-            ),
-            device=device
-        )
+        # 使用model_partition的时候需要注释掉下面两条kvcache，否则炸显存
+        self.cache_k = None
+        self.cache_v = None
+        # self.cache_k = torch.zeros(
+        #     (
+        #         args.max_batch_size,
+        #         args.max_seq_len,
+        #         self.n_local_kv_heads,
+        #         self.head_dim,
+        #     ),
+        #     device=device
+        # )
+        # self.cache_v = torch.zeros(
+        #     (
+        #         args.max_batch_size,
+        #         args.max_seq_len,
+        #         self.n_local_kv_heads,
+        #         self.head_dim,
+        #     ),
+        #     device=device
+        # )
 
     def forward(
         self,
@@ -150,6 +155,26 @@ class Attention(nn.Module):
     ):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        
+        
+        
+        # 不在init中初始化kvcache，否则爆显存
+        device = x.device
+        dtype = x.dtype
+
+        if self.cache_k is None:
+            self.cache_k = torch.zeros(
+                (bsz, self.max_seq_len, self.n_local_kv_heads, self.head_dim),
+                device=device,
+                dtype=dtype,
+            )
+            self.cache_v = torch.zeros(
+                (bsz, self.max_seq_len, self.n_local_kv_heads, self.head_dim),
+                device=device,
+                dtype=dtype,
+            )
+            
+        
 
         # 下面这三行是最初的版本，因为维数对不上而修改
         # xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
@@ -260,7 +285,6 @@ class Transformer(nn.Module):
         self.params = params
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers # 保留总层数
-
         if end_layer_idx == -1:
             end_layer_idx = total_layers - 1
 

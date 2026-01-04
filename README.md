@@ -77,3 +77,43 @@ python3 -m venv /root/pytorch-env
 source /root/pytorch-env/bin/activate # 激活虚拟环境
 deactivate # 退出虚拟环境
 ```
+
+# 🔧 Prerequisites
+- **Python**: 3.12 or higher
+- **Git**: For repository cloning and submodule management
+- **Cuda** compilation tools: 12.0 or higher
+- **Pytorch**: 2.7.0+cu128 or higher
+- **QEMU** emulator: 8.2.2
+- **Libvirt**: 10.0.0
+- **Conda**: For environment management (recommended)
+
+# 🚀 Set up
+### 1. Configure a VM with AMD-SEV support
+- Create a qcow2-format virtual disk and modify the `disk` option in `scripts/create_vm.sh`
+- Prepare the VM image and modify the `location` option in `scripts/create_vm.sh`
+
+```shell
+bash scripts/create_vm.sh
+```
+
+### 2. Start VM
+Modify `hda` option and `drive` option in `scripts/start_vm.sh` and then run
+```shell
+bash scripts/start_vm.sh
+```
+
+### 3. Run the main program
+```shell
+# at the root of the repository
+python client/client.py host
+python client/client.py guest
+```
+
+
+# 📣 Precautions
+1. You can define the trace (which layer to inference on host/guest) by changing the options at client/config_host.json and client/config_guest.json
+2. Remember config the model path in code, and perpare partitioned model in `model_partition.py` before running
+3. When unexpected memory leak happens if you hack the code, use `scripts/clear_ivshmem.sh` to clear the IVSHMEM
+4. You can use `scripts/update_code.sh` to easily synchronous your code in TEE.
+
+

@@ -5,13 +5,14 @@ from pathlib import Path
 import os
 import mmap
 import torch
+from transformers import AutoTokenizer
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 import core.ivshmem_comm as ic
 import core.inference_engine as ie
 from core.llama_model import Tokenizer
 
-TOKENIZER_PATH = "model/llama2/tokenizer.model"
+TOKENIZER_PATH = "model/llama-3-1b"
 
 # 加载模型配置
 def load_config(role: str):
@@ -90,7 +91,11 @@ def run_inference(config: dict, prompt: str = None):
     # 只有处理prompt的一端需要初始化Tokenizer
     tokenizer = None
     if is_initiator or is_ender:
-        tokenizer = Tokenizer(model_path=TOKENIZER_PATH)
+        # tokenizer = Tokenizer(model_path=TOKENIZER_PATH)
+        tokenizer = AutoTokenizer.from_pretrained(
+            TOKENIZER_PATH,
+            use_fast=False,
+        )
     print(f"[{role.upper()}] 准备进入主推理循环，使用READ_RET_OFFSET作为当前推理的start_pos的同步标记")
 
     # 存储已生成的 token ID (只有负责最后解码的一端，即开始推理的一端需要完整序列)
@@ -104,12 +109,18 @@ def run_inference(config: dict, prompt: str = None):
         ic.write_ret_uint8(shm, 0)
         if prompt is not None:
             print(f"[{role.upper()}] 编码prompt: {prompt}")
-            prompt_token_ids = torch.tensor(
-                [tokenizer.encode(prompt, bos=True, eos=False)],
-                dtype=torch.long,
-                device=device
-            )
+            # prompt_token_ids = torch.tensor(
+            #     [tokenizer.encode(prompt, bos=True, eos=False)],
+            #     dtype=torch.long,
+            #     device=device
+            # )
+            inputs = tokenizer(prompt, return_tensors='pt', add_special_tokens=True)
+            prompt_token_ids = inputs['input_ids'].to(device)
         start_time = time.time()
+        # 写入log.txt
+        with open("log.txt", "a") as f:
+            f.write(f"{start_time}\n")
+
 
     for current_start_pos in range(max_tokens):
         print(f"\n[{role.upper()}] === 开始处理 token {current_start_pos} (start_pos = {current_start_pos}) ===")
@@ -216,6 +227,8 @@ def run_inference(config: dict, prompt: str = None):
         output_text = tokenizer.decode(decoded_ids)
         print(f"\n[{role.upper()}] 解码结果: {output_text}")
         end_time = time.time()
+        with open("log.txt", "a") as f:
+            f.write(f"{end_time}\n")
         print(f"[{role.upper()}] 推理时间: {end_time - start_time:.4f}秒")
 
 

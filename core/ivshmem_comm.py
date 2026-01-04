@@ -57,7 +57,7 @@ def write_host_guest_uint8(shm, value):
     shm[HOST_GUEST_OFFSET:HOST_GUEST_OFFSET + 1] = value.to_bytes(1, 'little')
 
 def clear_shm(shm): # 清空共享内存
-    shm[HOST_GUEST_OFFSET + 1:] = bytearray(len(shm) - 3)
+    shm[HOST_GUEST_OFFSET + 1:HOST_GUEST_OFFSET + 16] = bytearray(15) # bytearray(len(shm) - 3)
 
 
 # 一层的输出->字节
