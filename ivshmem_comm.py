@@ -9,6 +9,7 @@ import ctypes
 LOCK_OFFSET = 0
 READ_RET_OFFSET = 1
 HOST_GUEST_OFFSET = 2
+ACK_FLAG = 2
 
 BLOCK_SIZE = 4096 + 9
 HEADER_SIZE = 9
@@ -155,72 +156,80 @@ def release_lock(shm):
 
 def write_blocks(shm, blocks, role):
     clear_shm(shm)
-    # acquire_lock(shm)
     try:
-        # write_host_guest_uint8(shm, 0 if role == "host" else 1)
-        
         offset = HOST_GUEST_OFFSET + 1
         block_count = 0
-        copy_time = 0.0
+        my_flag = 0 if role == "host" else 1
+
         for block in blocks:
+            # 当达到 4087 的倍数时，需要换页
             if block_count > 0 and block_count % MAX_BLOCK_NUM == 0:
-                # release_lock(shm)
-                write_host_guest_uint8(shm, 0 if role == "host" else 1)
-                time.sleep(1)
-                # acquire_lock(shm)
+                # 1. 改变标志位，通知接收方：“数据已就绪，快来读”
+                write_host_guest_uint8(shm, my_flag)
+                
+                # 2. 轮询等待接收方读完并回传 ACK_FLAG
+                while read_host_guest_uint8(shm) != ACK_FLAG:
+                    time.sleep(0.001)  # 极短休眠防止 CPU 100% 空转
+                    
+                # 3. 接收方处理完毕，重置指针，开始写下一页
                 offset = HOST_GUEST_OFFSET + 1
+
             shm[offset:offset+len(block)] = block
             offset += BLOCK_SIZE
             block_count += 1
+            
     finally:
-        # release_lock(shm)
-        write_host_guest_uint8(shm, 0 if role == "host" else 1)
+        # 全部写入完成后，更新标志位，发送最后不足一页的部分（或触发结束）
+        write_host_guest_uint8(shm, my_flag)
+
 
 def read_blocks(shm, role):
-    # acquire_lock(shm)
-    should_clear = True # can't clear if nothing read or no permission to read
-    have_blocks = False
-    try:
-        blocks = []
-        offset = HOST_GUEST_OFFSET + 1
-        copy_time = 0.0
-        while offset + HEADER_SIZE <= len(shm):
-            if role == "host" and read_host_guest_uint8(shm) == 0:
-                should_clear = False
-                continue
-            if role == "guest" and read_host_guest_uint8(shm) == 1:
-                should_clear = False
-                continue
-            header = shm[offset:offset+HEADER_SIZE]
-            if all(b == 0 for b in header):
-                should_clear = False
-                continue
-            have_blocks = True
-            msg_id, seq_id, is_last, payload_len = struct.unpack(BLOCK_HEADER_FORMAT, header)
-            payload_start = offset + HEADER_SIZE
-            payload_end = payload_start + payload_len
-            payload = shm[payload_start:payload_end]
-            full_block = header + payload
-            blocks.append(full_block)
-            offset += BLOCK_SIZE
-            if is_last:
-                break
-            else:
-                # havn't read the full tensor even reach the end of shm
-                # so clear shm and start from beginning, wait 1 second for writer to write more
-                if len(blocks) > 0 and len(blocks) % MAX_BLOCK_NUM == 0:
-                    clear_shm(shm)
-                    # release_lock(shm)
-                    time.sleep(2)
-                    # acquire_lock(shm)
-                    offset = HOST_GUEST_OFFSET + 1
-        if have_blocks:
-            pass
+    should_clear = False
+    blocks = []
+    offset = HOST_GUEST_OFFSET + 1
+    sender_flag = 1 if role == "host" else 0
+
+    # 非阻塞检查：如果发送方还没发信号，直接返回空列表交由外层 while 循环重试
+    if read_host_guest_uint8(shm) != sender_flag:
         return blocks
+        
+    should_clear = True
+    try:
+        while True:
+            # 轮询等待发送方通知当前页的数据已完全就绪
+            while read_host_guest_uint8(shm) != sender_flag:
+                time.sleep(0.001)
+
+            have_read_in_chunk = False
+            while offset + HEADER_SIZE <= len(shm):
+                header = shm[offset:offset+HEADER_SIZE]
+                if all(b == 0 for b in header):
+                    break
+
+                have_read_in_chunk = True
+                msg_id, seq_id, is_last, payload_len = struct.unpack(BLOCK_HEADER_FORMAT, header)
+                
+                payload_start = offset + HEADER_SIZE
+                payload_end = payload_start + payload_len
+                blocks.append(header + shm[payload_start:payload_end])
+                
+                offset += BLOCK_SIZE
+                
+                if is_last:
+                    return blocks
+            
+            # 读满当前页（达到 MAX_BLOCK_NUM）但张量还没传完
+            if have_read_in_chunk:
+                clear_shm(shm)
+                # 写入 ACK_FLAG，通知发送方：“这页我收到了，可以覆盖写下一页了”
+                write_host_guest_uint8(shm, ACK_FLAG)
+                offset = HOST_GUEST_OFFSET + 1
+                
     finally:
         if should_clear:
             clear_shm(shm)
-        # release_lock(shm)
+            # 彻底收尾，释放 SHM，方便进行下一波传输
+            write_host_guest_uint8(shm, ACK_FLAG)
 
 
 def lora_weight_config2bytes(model):
