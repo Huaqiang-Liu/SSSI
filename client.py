@@ -21,9 +21,9 @@ PRUNED = False
 
 # set different base model
 # BASE_MODEL = "deepseek-7b"
-BASE_MODEL = "llama-3-1b"
+# BASE_MODEL = "llama-3-1b"
 # BASE_MODEL = "gpt2-large"
-# BASE_MODEL = "llama-3-8b"
+BASE_MODEL = "llama-3-8b"
 # BASE_MODEL = "qwen-3-8b"
 
 # set different lora model (trained from different datasets)
@@ -260,6 +260,7 @@ def guest_main(set_multi_thread=False):
         ic.write_host_guest_uint8(shm, 1)
         while True:
             blocks = ic.read_blocks(shm, "guest")
+            print(f"guest读到{len(blocks)} blocks\n")
             if len(blocks) > 0:
                 split_point = ic.get_msg_id(blocks[0])
                 lora_weight_blocks = blocks[:split_point]
@@ -467,7 +468,8 @@ def host_main():
         base_model_dir,
         dtype=DEFAULT_DTYPE,
         # device_map=None,
-        device_map="auto" if not TEST_OUR_METHOD else None
+        # device_map="auto" if not TEST_OUR_METHOD else None
+        device_map="auto" if torch.cuda.is_available() else None
     )
     # base_model.to(device)
     
@@ -541,6 +543,7 @@ def host_main():
         lora_config_blocks = ic.bytes2blocks(lora_config_bytes, msg_id=lora_weights_block_num)
 
         packed_blocks = lora_weight_blocks + lora_config_blocks
+        print(f"host发送{len(packed_blocks)}个lora blocks给guest\n")
         ic.clear_shm(shm)
         ic.write_ret_uint8(shm, 0)
         ic.write_blocks(shm, packed_blocks, "host")
@@ -620,6 +623,35 @@ def test_basic_inference():
     print(output_text)
 
 
+# 传输80MiB的字节串（tensor）
+def test_big_data(shm_path):
+    with open(shm_path, "r+b") as f:
+        shm = mmap.mmap(f.fileno(), 16 * 1024 * 1024)
+        ic.clear_shm(shm)
+
+        if shm_path == "/sys/bus/pci/devices/0000:00:02.0/resource2": # guest
+            print("[Guest] Waiting for data from host...")
+            blocks = []
+            while True:
+                blocks = ic.read_blocks(shm, "guest")
+                if len(blocks) > 0 and ic.get_msg_id(blocks[0]) == 1:
+                    break
+                else:
+                    print("[Guest] No data received yet. Waiting...")
+                    time.sleep(0.01)
+            print(f"[Guest] Received {len(blocks)} blocks from host.")
+
+        elif shm_path == "/dev/shm/shm1": # host
+            data = bytes(80 * 1024 * 1024)  # 80MiB
+            # blocks = ic.tensor_bytes_and_module_name2blocks(data, msg_id=1)
+            blocks = ic.bytes2blocks(data, msg_id=1)
+
+            print(f"[Host] Sending {len(blocks)} blocks to guest...")
+            ic.write_blocks(shm, blocks, "host")
+
+        else:
+            print("未知shm路径")
+            return
 
 
 
@@ -634,7 +666,8 @@ def test_host():
         base_model_dir,
         torch_dtype=DEFAULT_DTYPE,
         # device_map=None,
-        device_map="auto" if not TEST_OUR_METHOD else None
+        # device_map="auto" if not TEST_OUR_METHOD else None
+        device_map="auto" if torch.cuda.is_available() else None
     )
     if PRUNED:
         _, unzero_modules = check_lora_weights_zero(lora_model_dir)
@@ -779,12 +812,14 @@ if __name__ == "__main__":
         if TEST_OUR_METHOD:
             host_main()
         else:
+            test_big_data(HOST_SHM_PATH)
             # test_host()
-            test_basic_inference()
+            # test_basic_inference()
         # test_rw_host()
     else:
         if not TEST_OUR_METHOD:
-            test_host()
+            test_big_data(GUEST_SHM_PATH)
+            # test_host()
         else:
             guest_main(set_multi_thread=False)
             # test_rw_guest()

@@ -150,6 +150,36 @@ def test_lora(shm_path):
             return
 
 
+# 传输80MiB的字节串（tensor）
+def test_big_data(shm_path):
+    with open(shm_path, "r+b") as f:
+        shm = mmap.mmap(f.fileno(), 16 * 1024 * 1024)
+        ic.clear_shm(shm)
+
+        if shm_path == "/sys/bus/pci/devices/0000:00:02.0/resource2": # guest
+            print("[Guest] Waiting for data from host...")
+            blocks = []
+            while True:
+                blocks = ic.read_blocks(shm, "guest")
+                if len(blocks) > 0 and ic.get_msg_id(blocks[0]) == 1:
+                    break
+                else:
+                    print("[Guest] No data received yet. Waiting...")
+                    time.sleep(0.01)
+            print(f"[Guest] Received {len(blocks)} blocks from host.")
+
+        elif shm_path == "/dev/shm/shm1": # host
+            data = bytes(80 * 1024 * 1024)  # 80MiB
+            # blocks = ic.tensor_bytes_and_module_name2blocks(data, msg_id=1)
+            blocks = ic.bytes2blocks(data, msg_id=1)
+
+            print(f"[Host] Sending {len(blocks)} blocks to guest...")
+            ic.write_blocks(shm, blocks, "host")
+
+        else:
+            print("未知shm路径")
+            return
+
 def main():
     args = parse_args()
 
@@ -162,11 +192,13 @@ def main():
         if args.role == "guest":
             shm_path = "/sys/bus/pci/devices/0000:00:02.0/resource2"
             # test_guest_ivshmem(shm_path)
-            test_lora(shm_path)
+            # test_lora(shm_path)
+            test_big_data(shm_path)
         elif args.role == "host":
             shm_path = "/dev/shm/shm1"
             # test_host_ivshmem(shm_path)
-            test_lora(shm_path)
+            # test_lora(shm_path)
+            test_big_data(shm_path)
 
 
 if __name__ == "__main__":
